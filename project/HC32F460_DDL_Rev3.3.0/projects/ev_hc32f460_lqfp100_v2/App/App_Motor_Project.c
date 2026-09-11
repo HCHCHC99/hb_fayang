@@ -296,12 +296,18 @@ static void RegisterAllDevices(void) {
         if (u32UndervoltageHysteresisMv == 0) {
             u32UndervoltageHysteresisMv = PARAM_DEFAULT_VOLTAGE_LOWER_HYSTERESIS * 100UL;
         }
-        if (u8OvervoltageTriggerCount == 0) {
+        /* 电压确认窗固定为29ms: 1ms节拍 x 连续30次越限(首末样本跨度>=29ms)
+         * 触发延迟理想 29~30ms; Flash 中可能存有旧默认值 0~11，统一拉到当前默认值 30 */
+        if (u8OvervoltageTriggerCount < PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT) {
             u8OvervoltageTriggerCount = PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT;
         }
-        if (u8UndervoltageTriggerCount == 0) {
+        if (u8UndervoltageTriggerCount < PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT) {
             u8UndervoltageTriggerCount = PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
         }
+
+        /* [临时改动] 关闭欠压检测: 阈值强制0mV, u32BusMv<=0 永不成立(母线电压含补偿至少400mV)
+         * 恢复: 删除下面一行, 欠压阈值恢复为 Flash/默认值 (21.0V) */
+        u32UndervoltageThresholdMv = 0UL;
 
         MAIN_D("[APP] Voltage config from Flash: upper=%lu mV (0.1V=%d), lower=%lu mV (0.1V=%d), "
             "upper_hys=%lu mV, lower_hys=%lu mV, ov_cnt=%d, uv_cnt=%d",
@@ -439,8 +445,8 @@ static void SetDeviceUpdateIntervals(void) {
     DeviceManager_SetUpdateInterval(ID_ADC_CURRENT, 1);   // ADC 快速采样
     DeviceManager_SetUpdateInterval(ID_ADC_VOLTAGE, 1);   // ADC 快速采样
 
-    // 传感器设备使用较慢的更新间隔 - 10ms 足够
-    DeviceManager_SetUpdateInterval(ID_VOLTAGE_BUS, 10);   // 10ms 检测一次电压
+    // 传感器设备使用较慢的更新间隔
+    DeviceManager_SetUpdateInterval(ID_VOLTAGE_BUS, 1);    // 1ms 检测一次电压 (1ms节拍x连续30次越限=29ms确认窗)
     DeviceManager_SetUpdateInterval(ID_SENSOR_CURRENT, 1); // 10ms 检测一次电流
     DeviceManager_SetUpdateInterval(ID_RTURN, 1);          // 1ms 更新一次角度
 }
@@ -670,10 +676,17 @@ void App_ReloadConfig(void)
             (uint32_t)g_AppParam.voltage_upper_hysteresis * 100UL;
         g_voltage_bus_dev->stcConfig.u32UndervoltageHysteresisMv =
             (uint32_t)g_AppParam.voltage_lower_hysteresis * 100UL;
+        /* 电压确认窗固定为29ms: Flash 旧值(0~11)统一拉到默认值 30 */
         g_voltage_bus_dev->stcConfig.u8OvervoltageTriggerCount =
-            g_AppParam.overvoltage_trigger_count;
+            (g_AppParam.overvoltage_trigger_count < PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT)
+                ? PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT
+                : g_AppParam.overvoltage_trigger_count;
         g_voltage_bus_dev->stcConfig.u8UndervoltageTriggerCount =
-            g_AppParam.undervoltage_trigger_count;
+            (g_AppParam.undervoltage_trigger_count < PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT)
+                ? PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT
+                : g_AppParam.undervoltage_trigger_count;
+        /* [临时改动] 欠压检测关闭: 阈值强制0mV (恢复: 删除下面一行) */
+        g_voltage_bus_dev->stcConfig.u32UndervoltageThresholdMv = 0UL;
 
         MAIN_D("[RELOAD] Voltage: over=%lu mV, under=%lu mV\r\n",
                g_voltage_bus_dev->stcConfig.u32OvervoltageThresholdMv,

@@ -1,0 +1,25 @@
+{
+	"nodes":[
+		{"id":"c_start","type":"text","text":"## 多设备ID分配 · 三步完成\n一条总线挂10~30台同型号设备，出厂ID都是1，直接用会冲突。\n\n**核心思路：每台设备内置全球唯一的芯片UID（出厂固化，不可改不可丢），用UID当身份证。**\n\n清点 → 分配 → 验证，全程免拆机、免按键、免临时单接，只在总线上操作。","x":-240,"y":-40,"width":470,"height":260,"color":"4"},
+		{"id":"c_step1","type":"text","text":"### 第1步 设备清点\n您在总线上广播一条收集指令，然后等几秒\n（一轮约3~4秒，一般2~3轮收齐）。\n\n总线上每台设备**自动依次上报**：本机UID + 当前ID。\n无需逐台接线，无需人工干预。","x":-240,"y":300,"width":470,"height":200},
+		{"id":"c_list","type":"text","text":"### 您得到一张完整清单\n- 待分配：哪些设备还是出厂ID=1\n- 查占用：哪些ID已被使用，避免重复分配\n- 发现冲突：两台ID相同的设备会同时出现在清单里\n- 盘点：随时重跑一遍，即知当前在线设备","x":-240,"y":580,"width":470,"height":220,"color":"4"},
+		{"id":"c_step2","type":"text","text":"### 第2步 分配ID\n您（或上位机软件）决定每台UID对应的新ID，**逐台**下发绑定指令：\n指令携带 目标设备UID + 新ID。\n\n所有设备都收到，但只有UID与指令一致的那台执行，其余不受影响——\n即使全员都是ID=1也能准确送达。\n首次分配与日后修改ID用**同一条指令**。","x":-300,"y":880,"width":530,"height":240},
+		{"id":"c_step3","type":"text","text":"### 第3步 验证\n用新ID读取设备的UID，与清单比对。\n全部一致 → 分配完成；不一致可重试。","x":-240,"y":1200,"width":470,"height":180},
+		{"id":"c_done","type":"text","text":"### 完成\n新ID写入非易失存储，掉电不丢，总线恢复正常通信。\n日后加新设备、改ID、盘点在线设备，重跑本流程即可。","x":-240,"y":1460,"width":470,"height":180,"color":"4"},
+		{"id":"c_you","type":"text","text":"### 您需要做的（主机侧）\n实现三个标准Modbus RTU报文的收发与解析（含CRC16）：\n1. 收集指令（广播）→ 触发设备上报\n2. 接收UID上报帧 → 记录UID+当前ID清单（错误帧直接丢弃）\n3. 绑定指令（广播）→ 逐台下发UID+新ID，等应答（建议超时≥300ms）\n\n具体报文格式、字节序、示例帧见我方通信协议文档。","x":460,"y":140,"width":440,"height":400},
+		{"id":"c_we","type":"text","text":"### 我们负责的（设备固件）\n- 多台同时上报的冲突自动处理：设备自动错开时隙、自动重报，您只需按轮次多广播几次\n- UID核对、ID写入与掉电保存\n- 提供完整协议文档与联调支持","x":460,"y":580,"width":440,"height":200,"color":"4"},
+		{"id":"c_faq","type":"text","text":"### 常见问题\nQ 新设备中途加入总线？→ 重跑清点+分配即可\nQ 改某台ID会影响其他设备吗？→ 不会，按UID精确匹配\nQ 两台ID已配成一样？→ 不影响，清点按UID上报，逐台重分配即可理顺\nQ ID会掉电丢失吗？→ 不会，存非易失存储\nQ 什么时机执行？→ 建议设备空闲时（如产线配置阶段）","x":460,"y":840,"width":440,"height":280,"color":"2"},
+		{"id":"c_time","type":"text","text":"### 时间预期（9600bps，30台）\n清点：2~3轮，合计约10~20秒\n逐台分配：每台不到0.5秒，30台约10秒\n验证：每台一次读取，秒级\n\n整体产线配置一台设备几分钟内完成。","x":460,"y":1200,"width":440,"height":180}
+	],
+	"edges":[
+		{"id":"e1","fromNode":"c_start","fromSide":"bottom","toNode":"c_step1","toSide":"top"},
+		{"id":"e2","fromNode":"c_step1","fromSide":"bottom","toNode":"c_list","toSide":"top","label":"收集完成"},
+		{"id":"e3","fromNode":"c_list","fromSide":"bottom","toNode":"c_step2","toSide":"top","label":"据清单确定UID→ID分配表"},
+		{"id":"e4","fromNode":"c_step2","fromSide":"bottom","toNode":"c_step3","toSide":"top","label":"逐台下发完成"},
+		{"id":"e5","fromNode":"c_step3","fromSide":"bottom","toNode":"c_done","toSide":"top","label":"全部比对一致"},
+		{"id":"e6","fromNode":"c_step1","fromSide":"right","toNode":"c_you","toSide":"left","label":"需要发什么"},
+		{"id":"e7","fromNode":"c_step2","fromSide":"right","toNode":"c_we","toSide":"left","label":"设备侧自动执行"},
+		{"id":"e8","fromNode":"c_step3","fromSide":"right","toNode":"c_time","toSide":"left","label":"多久能搞定"},
+		{"id":"e9","fromNode":"c_step2","fromSide":"bottom","toNode":"c_faq","toSide":"top","color":"2","label":"特殊情况"}
+	]
+}
