@@ -1,0 +1,982 @@
+﻿#include "App_Params.h"
+#include "App_FaultHandler.h"
+#include "param_manager.h"
+#include "TickTimer.h"
+#include "device_manager.h"
+#include "dev_rturn.h"
+#include "dev_voltage.h"
+#include "dev_sensor.h"
+#include "dev_motor_hall.h"
+#include "EventBus.h"
+#include "dev_motor.h"
+#include "App_Motor_Project.h"
+#include "App_RunAngle.h"
+#include <string.h>
+
+/*=============================================================================
+ * 模拟实时数据调试打印宏
+ *============================================================================*/
+#ifdef APP_PARAMS_SIM_DBG
+    #define SIM_DATA_DBG(fmt, ...)    MAIN_D("[SIM_DATA] " fmt, ##__VA_ARGS__)
+#else
+    #define SIM_DATA_DBG(fmt, ...)    ((void)0)
+#endif
+
+/*=============================================================================
+ * 全局变量定义
+ *============================================================================*/
+AppParamRecord_t g_AppParam;            /* 应用程序参数（Flash 存储） */
+AppRealTimeData_t g_RealTimeData;
+volatile int32_t g_s32HallPulseAccum = 0;  /* 霍尔脉冲累积(只在上电清零) */       /* 实时数据（不存 Flash） */
+SimRealtimeData_t g_SimRealtimeData;    /* 模拟实时数据（Keil Debug 修改） */
+
+/*=============================================================================
+ * 模拟实时数据局部缓存变量（用于检测变化）
+ *============================================================================*/
+static int16_t  s_lastSpeed = -1;
+static int16_t  s_lastAngle = -1;
+static uint16_t s_lastVoltage = 0;
+static uint16_t s_lastCurrent = 0;
+static int16_t  s_lastDirection = -2;
+
+/*=============================================================================
+ * REG_CTRL_CMD (0x2720) 控制寄存器状态
+ * bit0: 解锁标志（脉冲式，写1解锁后自动变回0）
+ * bit1: 上锁标志（脉冲式，写1上锁后自动变回0）
+ * bit2: 急停标志（脉冲式，写1急停后自动变回0）
+ * bit3: 延时复位标志（脉冲式，写1触发后自动变回0）
+ * bit4: 正转状态（保持式，正转过程中为1，停止后变回0）
+ * bit5: 反转状态（保持式，反转过程中为1，停止后变回0）
+ *============================================================================*/
+static bool s_bCtrlCmdUnlocked = false;     // true=已解锁，可写bit3~bit5
+static uint16_t s_u16CtrlCmdState = 0;      // 当前寄存器状态（用于读回）
+
+/*=============================================================================
+ * 延时复位相关变量
+ *============================================================================*/
+#define RESET_DELAY_MS  (1000)  // 延时复位等待时间(ms)
+static bool m_bResetPending = false;
+static NonBlockingDelay_t m_stcResetDelay;
+
+/*=============================================================================
+ * @brief  检查电机是否正在正转
+ * @retval true  正在正转
+ * @retval false 未正转
+ *============================================================================*/
+static bool CtrlCmd_IsMotorFwd(void)
+{
+    /* 通过 dev_motor_hall 检测实际转向 */
+    MotorHall_DirectionResponse_t stcDirResp;
+    DeviceCommandData_t stcCmd;
+    memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+    stcCmd.cmd = CMD_MOTOR_HALL_GET_DIRECTION;
+    stcCmd.params = NULL;
+    stcCmd.param_size = 0;
+    stcCmd.response = &stcDirResp;
+    stcCmd.response_size = sizeof(MotorHall_DirectionResponse_t);
+
+    DeviceResult_t res = Device_Control(ID_MOTOR_HALL, &stcCmd);
+    if (res == RESULT_OK && stcDirResp.direction == 1U) {
+        return true;
+    }
+
+    /* 通过 dev_motor 仲裁器输出检测 */
+    DeviceNode_t* pstcMotorNode = DeviceManager_Get(ID_MOTOR);
+    if (pstcMotorNode != NULL && pstcMotorNode->private_data != NULL) {
+        MotorDevice_t* pstcMotorDev = (MotorDevice_t*)pstcMotorNode->private_data;
+        if (Motor_GetDesiredDirection(pstcMotorDev) == DIR_FWD) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*=============================================================================
+ * @brief  检查电机是否正在反转
+ * @retval true  正在反转
+ * @retval false 未反转
+ *============================================================================*/
+static bool CtrlCmd_IsMotorRev(void)
+{
+    /* 通过 dev_motor_hall 检测实际转向 */
+    MotorHall_DirectionResponse_t stcDirResp;
+    DeviceCommandData_t stcCmd;
+    memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+    stcCmd.cmd = CMD_MOTOR_HALL_GET_DIRECTION;
+    stcCmd.params = NULL;
+    stcCmd.param_size = 0;
+    stcCmd.response = &stcDirResp;
+    stcCmd.response_size = sizeof(MotorHall_DirectionResponse_t);
+
+    DeviceResult_t res = Device_Control(ID_MOTOR_HALL, &stcCmd);
+    if (res == RESULT_OK && stcDirResp.direction == 2U) {
+        return true;
+    }
+
+    /* 通过 dev_motor 仲裁器输出检测 */
+    DeviceNode_t* pstcMotorNode = DeviceManager_Get(ID_MOTOR);
+    if (pstcMotorNode != NULL && pstcMotorNode->private_data != NULL) {
+        MotorDevice_t* pstcMotorDev = (MotorDevice_t*)pstcMotorNode->private_data;
+        if (Motor_GetDesiredDirection(pstcMotorDev) == DIR_REV) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/*=============================================================================
+ * @brief  检查电机是否停止
+ * @retval true  已停止
+ * @retval false 正在运行
+ *============================================================================*/
+static bool CtrlCmd_IsMotorStopped(void)
+{
+    return (!CtrlCmd_IsMotorFwd() && !CtrlCmd_IsMotorRev());
+}
+
+/*=============================================================================
+ * Public: control-lock state queries for external modules (e.g. RunAngle)
+ *============================================================================*/
+
+bool Param_IsCtrlUnlocked(void)
+{
+    return s_bCtrlCmdUnlocked;
+}
+
+bool Param_IsMotorStopped(void)
+{
+    return CtrlCmd_IsMotorStopped();
+}
+
+/*=============================================================================
+ * @brief  根据寄存器地址读取参数值
+ * @param  regAddr  寄存器地址
+ * @param  pValue   输出参数值指针
+ * @return PARAM_OK 成功，PARAM_ERR_INVD_PARAM 无效地址
+ *============================================================================*/
+int32_t Param_ReadByReg(uint16_t regAddr, uint16_t *pValue)
+{
+    if (pValue == NULL)
+    {
+        return PARAM_ERR;
+    }
+
+    switch (regAddr)
+    {
+    /* --- 配置参数（Flash 存储） --- */
+    case REG_NODE_ID:
+        *pValue = g_AppParam.node_id;
+        break;
+
+    case REG_TARGET_SPEED:
+        *pValue = (uint16_t)g_AppParam.target_speed;
+        break;
+
+    case REG_TARGET_ANGLE:
+        *pValue = (uint16_t)g_AppParam.target_angle;
+        break;
+
+    case REG_VOLTAGE_UPPER_LIMIT:
+        *pValue = g_AppParam.voltage_upper_limit;
+        break;
+
+    case REG_VOLTAGE_LOWER_LIMIT:
+        *pValue = g_AppParam.voltage_lower_limit;
+        break;
+
+    case REG_CURRENT_UPPER_LIMIT:
+        *pValue = g_AppParam.current_upper_limit;
+        break;
+
+    case REG_CLOSE_LIMIT_ANGLE:
+        *pValue = (uint16_t)g_AppParam.close_limit_angle;
+        break;
+
+    case REG_OPEN_LIMIT_ANGLE:
+        *pValue = (uint16_t)g_AppParam.open_limit_angle;
+        break;
+
+    case REG_CURRENT_DETECT_MS:
+        *pValue = g_AppParam.current_detect_ms;
+        break;
+
+        case REG_MOTOR_HALL_DIR:
+            *pValue = g_AppParam.motor_hall_dir;
+            return 0;
+        case REG_MOTOR_DIR:
+            *pValue = g_AppParam.motor_dir;
+            return 0;
+
+
+        case REG_RTURN_REDUCTION_RATIO:
+            *pValue = g_AppParam.rturn_reduction_ratio;
+            return 0;
+        case REG_MOTOR_HALL_POLE_PAIRS:
+            *pValue = g_AppParam.motor_hall_pole_pairs;
+            return 0;
+
+        case REG_MOTOR_HALL_COUNT_LO:
+            *pValue = (uint16_t)(g_s32HallPulseAccum & 0xFFFFU);
+            return 0;
+        case REG_MOTOR_HALL_COUNT_HI:
+            *pValue = (uint16_t)((g_s32HallPulseAccum >> 16) & 0xFFFFU);
+            return 0;
+
+        case REG_ABS_ANGLE_LO:
+        {
+            int32_t s32Offset = RunAngle_GetOffset_x10();
+            *pValue = (uint16_t)(s32Offset & 0x0000FFFFU);
+            return 0;
+        }
+        case REG_ABS_ANGLE_HI:
+        {
+            int32_t s32Offset = RunAngle_GetOffset_x10();
+            *pValue = (uint16_t)((s32Offset >> 16) & 0x0000FFFFU);
+            return 0;
+        }
+
+        case REG_FLASH_ABS_LO:
+        {
+            int32_t s32Flash = RunAngle_GetFlashOffset_x10();
+            *pValue = (uint16_t)(s32Flash & 0x0000FFFFU);
+            return 0;
+        }
+        case REG_FLASH_ABS_HI:
+        {
+            int32_t s32Flash = RunAngle_GetFlashOffset_x10();
+            *pValue = (uint16_t)((s32Flash >> 16) & 0x0000FFFFU);
+            return 0;
+        }
+
+        case REG_ABS_THRESHOLD:
+            *pValue = g_AbsAngle.goto_zero_thresh_x10;
+            return 0;
+
+        case REG_ABS_TARGET_LO:
+        {
+            int32_t s32Target = RunAngle_GetTarget_x10();
+            *pValue = (uint16_t)(s32Target & 0x0000FFFFU);
+            return 0;
+        }
+        case REG_ABS_TARGET_HI:
+        {
+            int32_t s32Target = RunAngle_GetTarget_x10();
+            *pValue = (uint16_t)((s32Target >> 16) & 0x0000FFFFU);
+            return 0;
+        }
+
+        case REG_CALIB_UPPER_X10:
+            *pValue = (uint16_t)g_AppParam.calib_upper_x10;
+            return 0;
+
+        case REG_CALIB_LOWER_X10:
+            *pValue = (uint16_t)g_AppParam.calib_lower_x10;
+            return 0;
+
+        case REG_HEARTBEAT:
+            *pValue = g_AppParam.node_id;
+            return 0;
+
+    /* --- 实时数据（不存 Flash） --- */
+    case REG_REAL_SPEED:
+        *pValue = (uint16_t)g_RealTimeData.real_speed;
+        break;
+
+    case REG_REAL_ANGLE:
+        *pValue = (uint16_t)g_RealTimeData.real_angle;
+        break;
+
+    case REG_REAL_VOLTAGE:
+        *pValue = g_RealTimeData.real_voltage;
+        break;
+
+    case REG_REAL_CURRENT:
+        *pValue = g_RealTimeData.real_current;
+        break;
+
+    case REG_REAL_DIRECTION:
+        *pValue = (uint16_t)g_RealTimeData.real_direction;
+        break;
+
+    case REG_FAULT_STATUS:
+        *pValue = g_RealTimeData.fault_status;
+        break;
+
+    /* --- 控制命令（读回电机仲裁器当前方向） --- */
+    case REG_CTRL_CMD:
+    {
+        /* 读 REG_CTRL_CMD 返回电机当前转向状态：
+         *   bit4 = 1: 正在正转
+         *   bit5 = 1: 正在反转
+         *   bit4=0 且 bit5=0: 停止
+         */
+        uint16_t u16Value = 0U;
+
+        /* 通过 Device Manager 读取电机霍尔方向 */
+        MotorHall_DirectionResponse_t stcDirResp;
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_MOTOR_HALL_GET_DIRECTION;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &stcDirResp;
+        stcCmd.response_size = sizeof(MotorHall_DirectionResponse_t);
+
+        DeviceResult_t res = Device_Control(ID_MOTOR_HALL, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            /* direction: 0=停止, 1=正转, 2=反转 */
+            if (stcDirResp.direction == 1U)
+            {
+                u16Value |= CTRL_CMD_FWD;   /* bit4=1: 正在正转 */
+            }
+            else if (stcDirResp.direction == 2U)
+            {
+                u16Value |= CTRL_CMD_REV;   /* bit5=1: 正在反转 */
+            }
+            /* 0=停止: bit4=0, bit5=0 */
+        }
+
+        *pValue = u16Value;
+        break;
+    }
+
+    default:
+        /* 未定义的保留寄存器（如 0x2713、0x2717~0x271B、0x271F），返回 0 */
+        if ((regAddr >= 0x2710U) && (regAddr <= 0x271EU))
+        {
+            *pValue = 0U;
+            return PARAM_OK;
+        }
+        return PARAM_ERR_INVD_PARAM;
+    }
+
+    return PARAM_OK;
+}
+
+/*=============================================================================
+ * @brief  根据寄存器地址写入参数值
+ * @param  regAddr  寄存器地址
+ * @param  value    要写入的值
+ * @return PARAM_OK 成功，PARAM_ERR_INVD_PARAM 无效地址
+ *============================================================================*/
+int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
+{
+    switch (regAddr)
+    {
+    case REG_NODE_ID:
+        g_AppParam.node_id = value;
+        break;
+
+    case REG_TARGET_SPEED:
+        g_AppParam.target_speed = (int16_t)value;
+        break;
+
+    case REG_TARGET_ANGLE:
+        g_AppParam.target_angle = (int16_t)value;
+        break;
+
+    case REG_VOLTAGE_UPPER_LIMIT:
+        g_AppParam.voltage_upper_limit = value;
+        break;
+
+    case REG_VOLTAGE_LOWER_LIMIT:
+        g_AppParam.voltage_lower_limit = value;
+        break;
+
+    case REG_CURRENT_UPPER_LIMIT:
+        g_AppParam.current_upper_limit = value;
+        break;
+
+    case REG_CLOSE_LIMIT_ANGLE:
+        g_AppParam.close_limit_angle = (int16_t)value;
+        break;
+
+    case REG_OPEN_LIMIT_ANGLE:
+        g_AppParam.open_limit_angle = (int16_t)value;
+        break;
+
+    case REG_CURRENT_DETECT_MS:
+        g_AppParam.current_detect_ms = value;
+        break;
+
+        case REG_MOTOR_HALL_DIR:
+            g_AppParam.motor_hall_dir = value;
+            break;
+        case REG_MOTOR_DIR:
+            g_AppParam.motor_dir = value;
+            break;
+
+        case REG_RTURN_REDUCTION_RATIO:
+            g_AppParam.rturn_reduction_ratio = value;
+            break;
+        case REG_MOTOR_HALL_POLE_PAIRS:
+            g_AppParam.motor_hall_pole_pairs = value;
+            break;
+
+        case REG_MOTOR_HALL_COUNT_LO:
+            /* 写0x0000到低16位 = 清零累积值 */
+            if (value == 0) { g_s32HallPulseAccum = 0; }
+            break;
+        case REG_MOTOR_HALL_COUNT_HI:
+            /* 高16位只读，写入无效 */
+            break;
+
+    /* --- 绝对角度目标值: 0x2727=LO / 0x2728=HI (int32, 0.1°; 0x10 写完触发, 0x06 不触发) --- */
+    case REG_ABS_TARGET_LO:
+    {
+        int32_t s32Cur = RunAngle_GetTarget_x10();
+        int32_t s32New = (s32Cur & 0xFFFF0000UL) | ((int32_t)(uint16_t)value);
+        RunAngle_SetTarget_x10(s32New);
+        break;
+    }
+    case REG_ABS_TARGET_HI:
+    {
+        int32_t s32Cur = RunAngle_GetTarget_x10();
+        int32_t s32New = (s32Cur & 0x0000FFFFUL) | (((int32_t)(uint16_t)value) << 16);
+        RunAngle_SetTarget_x10(s32New);
+        break;
+    }
+
+    case REG_CALIB_UPPER_X10:
+        g_AppParam.calib_upper_x10 = (int16_t)value;
+        break;
+
+    case REG_CALIB_LOWER_X10:
+        g_AppParam.calib_lower_x10 = (int16_t)value;
+        break;
+
+    /* --- 控制命令：写 REG_CTRL_CMD --- */
+    case REG_CTRL_CMD:
+    {
+        /* REG_CTRL_CMD (0x2720) 位定义：
+         *   bit0 = 1: 解锁（脉冲式），解锁后允许写 bit3~bit5
+         *   bit1 = 1: 上锁（脉冲式），上锁后拒绝写 bit3~bit5
+         *   bit2 = 1: 急停（脉冲式），任何时候都响应
+         *   bit3 = 1: 延时复位（脉冲式），触发后执行复位延时
+         *   bit4 = 1: 正转（保持式），正转过程中为1，停止后变回0
+         *   bit5 = 1: 反转（保持式），反转过程中为1，停止后变回0
+         */
+
+        /* 解析写入值 */
+        bool bUnlock = (value & CTRL_CMD_START) != 0U;  /* bit0: 解锁 */
+        bool bLock   = (value & CTRL_CMD_STOP) != 0U;   /* bit1: 上锁 */
+        bool bEStop  = (value & CTRL_CMD_ESTOP) != 0U;  /* bit2: 急停 */
+        bool bReset  = (value & 0x0008U) != 0U;         /* bit3: 延时复位 */
+        bool bFwd    = (value & CTRL_CMD_FWD) != 0U;    /* bit4: 正转 */
+        bool bRev    = (value & CTRL_CMD_REV) != 0U;    /* bit5: 反转 */
+
+        MotorManualIOEvent_t stcEvent;
+        memset(&stcEvent, 0, sizeof(MotorManualIOEvent_t));
+
+        /* ===== 优先级1: 急停（任何时候都响应） ===== */
+        if (bEStop)
+        {
+            /* bit2=1: 急停指令，立即停止电机 */
+            stcEvent.dir = DIR_NONE;
+            stcEvent.type = CMD_TYPE_STOP;
+            stcEvent.speed = 0.0f;
+
+            /* 急停后清除正转/反转状态 */
+            s_u16CtrlCmdState &= (uint16_t)(~(CTRL_CMD_FWD | CTRL_CMD_REV));
+
+            PARAMS_DBG("REG_CTRL_CMD: ESTOP (value=0x%04X)", (unsigned int)value);
+            EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
+            break;
+        }
+
+        /* ===== 优先级2: 解锁（bit0） ===== */
+        if (bUnlock)
+        {
+            /* bit0=1: 解锁对 bit3~bit5 的控制权限 */
+            s_bCtrlCmdUnlocked = true;
+            PARAMS_DBG("REG_CTRL_CMD: UNLOCK (value=0x%04X), bit3~bit5 now writable", (unsigned int)value);
+            /* 脉冲式，解锁后不发布事件 */
+            break;
+        }
+
+        /* ===== 优先级3: 上锁（bit1） ===== */
+        if (bLock)
+        {
+            /* bit1=1: 上锁对 bit3~bit5 的控制权限 */
+            s_bCtrlCmdUnlocked = false;
+            PARAMS_DBG("REG_CTRL_CMD: LOCK (value=0x%04X), bit3~bit5 now locked", (unsigned int)value);
+            /* 脉冲式，上锁后不发布事件 */
+            break;
+        }
+
+        /* ===== 以下 bit3~bit5 需要已解锁状态 ===== */
+        if (!s_bCtrlCmdUnlocked)
+        {
+            PARAMS_DBG("REG_CTRL_CMD: IGNORED (value=0x%04X), not unlocked", (unsigned int)value);
+            break;
+        }
+
+        /* ===== bit3: 延时复位（脉冲式） ===== */
+        if (bReset)
+        {
+            /* 复位请求已在 App_Modbus 层处理，这里只需要记录日志 */
+            PARAMS_DBG("REG_CTRL_CMD: RESET BIT RECEIVED (value=0x%04X)", (unsigned int)value);
+            break;
+        }
+
+        /* ===== bit4/bit5: 正转/反转 ===== */
+        if (bFwd && !bRev)
+        {
+            /* bit4=1, bit5=0: 正转指令 */
+            /* 先检测：dev_motor_hall 不为反转，dev_motor 仲裁器不为反转 */
+            if (!CtrlCmd_IsMotorRev())
+            {
+                stcEvent.dir = DIR_FWD;
+                stcEvent.type = CMD_TYPE_RUN_FWD;
+                stcEvent.speed = 0.0f;
+
+                /* 设置正转状态（保持式） */
+                s_u16CtrlCmdState |= CTRL_CMD_FWD;
+                s_u16CtrlCmdState &= (uint16_t)(~CTRL_CMD_REV);
+
+                PARAMS_DBG("REG_CTRL_CMD: RUN FWD (value=0x%04X)", (unsigned int)value);
+                EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
+            }
+            else
+            {
+                PARAMS_DBG("REG_CTRL_CMD: RUN FWD REJECTED - motor is reversing (value=0x%04X)", (unsigned int)value);
+            }
+        }
+        else if (bRev && !bFwd)
+        {
+            /* bit5=1, bit4=0: 反转指令 */
+            /* 先检测：dev_motor_hall 不为正转，dev_motor 仲裁器不为正转 */
+            if (!CtrlCmd_IsMotorFwd())
+            {
+                stcEvent.dir = DIR_REV;
+                stcEvent.type = CMD_TYPE_RUN_REV;
+                stcEvent.speed = 0.0f;
+
+                /* 设置反转状态（保持式） */
+                s_u16CtrlCmdState |= CTRL_CMD_REV;
+                s_u16CtrlCmdState &= (uint16_t)(~CTRL_CMD_FWD);
+
+                PARAMS_DBG("REG_CTRL_CMD: RUN REV (value=0x%04X)", (unsigned int)value);
+                EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
+            }
+            else
+            {
+                PARAMS_DBG("REG_CTRL_CMD: RUN REV REJECTED - motor is forwarding (value=0x%04X)", (unsigned int)value);
+            }
+        }
+        else
+        {
+            /* bit4 和 bit5 同时为 1 或都为 0：视为无效 */
+            PARAMS_DBG("REG_CTRL_CMD: INVALID (value=0x%04X), bit4/bit5 conflict or both zero", (unsigned int)value);
+        }
+        break;
+    }
+
+    /* --- 故障清除：写 REG_FAULT_STATUS 触发 FaultHandler_ClearFault() --- */
+    case REG_FAULT_STATUS:
+        /* 遍历每个故障位，调用 FaultHandler_ClearFault() */
+        if (value & FAULT_BIT_OVERVOLTAGE)
+        {
+            FaultHandler_ClearFault(FAULT_TYPE_OVERVOLTAGE);
+        }
+        if (value & FAULT_BIT_UNDERVOLTAGE)
+        {
+            FaultHandler_ClearFault(FAULT_TYPE_UNDERVOLTAGE);
+        }
+        if (value & FAULT_BIT_OVERCURRENT_FWD)
+        {
+            FaultHandler_ClearFault(FAULT_TYPE_OVERCURRENT);
+        }
+        /* 如果写入0x0000，清除所有故障 */
+        if (value == 0U)
+        {
+            FaultHandler_ClearFault(FAULT_TYPE_OVERVOLTAGE);
+            FaultHandler_ClearFault(FAULT_TYPE_UNDERVOLTAGE);
+            FaultHandler_ClearFault(FAULT_TYPE_OVERCURRENT);
+        }
+        break;
+
+    default:
+        return PARAM_ERR_INVD_PARAM;
+    }
+
+    return PARAM_OK;
+}
+
+/*=============================================================================
+ * @brief  设置故障位（按位或）
+ * @param  bitMask  故障位掩码 (FAULT_BIT_xxx)
+ *============================================================================*/
+void RealTime_SetFault(uint16_t bitMask)
+{
+    g_RealTimeData.fault_status |= bitMask;
+}
+
+/*=============================================================================
+ * @brief  清除故障位（按位与取反）
+ * @param  bitMask  故障位掩码 (FAULT_BIT_xxx)
+ *============================================================================*/
+void RealTime_ClearFault(uint16_t bitMask)
+{
+    g_RealTimeData.fault_status &= (uint16_t)(~bitMask);
+}
+
+/*=============================================================================
+ * @brief  检查故障位
+ * @param  bitMask  故障位掩码 (FAULT_BIT_xxx)
+ * @retval true     该故障位为 1
+ * @retval false    该故障位为 0
+ *============================================================================*/
+bool RealTime_CheckFault(uint16_t bitMask)
+{
+    return (g_RealTimeData.fault_status & bitMask) != 0U;
+}
+
+/*=============================================================================
+ * @brief  更新实时数据（供其他设备模块调用）
+ * @param  speed      实时转速 (r/min)，传 NULL 表示不更新
+ * @param  angle      实时角度 (0.1度)，传 NULL 表示不更新
+ * @param  voltage    电压 (0.1V)，传 NULL 表示不更新
+ * @param  current    电流 (1mA)，传 NULL 表示不更新
+ * @param  direction  实时转向，传 NULL 表示不更新
+ *============================================================================*/
+void RealTime_Update(const int16_t  *speed,
+                     const int16_t  *angle,
+                     const uint16_t *voltage,
+                     const uint16_t *current,
+                     const int16_t  *direction)
+{
+    if (speed != NULL)
+    {
+        g_RealTimeData.real_speed = *speed;
+    }
+    if (angle != NULL)
+    {
+        g_RealTimeData.real_angle = *angle;
+    }
+    if (voltage != NULL)
+    {
+        g_RealTimeData.real_voltage = *voltage;
+    }
+    if (current != NULL)
+    {
+        g_RealTimeData.real_current = *current;
+    }
+    if (direction != NULL)
+    {
+        g_RealTimeData.real_direction = *direction;
+    }
+}
+
+/*=============================================================================
+ * @brief  从设备读取实时数据并更新到 g_RealTimeData
+ *         仅在 APP_PARAMS_USE_DEV_RTURN 宏开启时有效
+ *============================================================================*/
+void RealTime_UpdateFromDevice(uint8_t u8RTurnDevId,
+                               uint8_t u8VoltageDevId,
+                               uint8_t u8SensorDevId)
+{
+#ifdef APP_PARAMS_USE_DEV_RTURN
+    DeviceResult_t res;
+    float fSpeedDegS = 0.0f;        /* dev_rturn 角速度 (deg/s) */
+    float fAngleDeg = 0.0f;         /* dev_rturn 角度 (deg) */
+    uint8_t u8Dir = 0;              /* dev_rturn 方向 */
+    uint32_t u32BusVoltageMv = 0;   /* dev_voltage 母线电压 (mV) */
+    int32_t s32CurrentMa = 0;       /* dev_sensor 电流 (mA) */
+    int16_t s16SpeedRpm = 0;        /* Modbus 转速 (r/min) */
+    int16_t s16Angle01 = 0;         /* Modbus 角度 (0.1deg) */
+    uint16_t u16Voltage01 = 0;      /* Modbus 电压 (0.1V) */
+    uint16_t u16CurrentMa = 0;      /* Modbus 电流 (1mA) */
+    int16_t s16Direction = 0;       /* Modbus 转向 */
+
+    /* 1. 从 dev_rturn 读取角速度 (deg/s) -> 换算为 r/min */
+    {
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_RTURN_GET_SPEED;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &fSpeedDegS;
+        stcCmd.response_size = sizeof(float);
+
+        res = Device_Control(u8RTurnDevId, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            /* deg/s -> r/min: r/min = deg/s / 360 * 60 = deg/s / 6 */
+            s16SpeedRpm = (int16_t)(fSpeedDegS / 6.0f);
+        }
+        else
+        {
+            PARAMS_DBG("UpdateFromDevice: CMD_RTURN_GET_SPEED failed, res=%d", (int)res);
+        }
+    }
+
+    /* 2. 从 dev_rturn 读取角度 (deg) -> 换算为 0.1deg */
+    {
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_RTURN_GET_ANGLE_DEG;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &fAngleDeg;
+        stcCmd.response_size = sizeof(float);
+
+        res = Device_Control(u8RTurnDevId, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            /* deg -> 0.1deg */
+            s16Angle01 = (int16_t)(fAngleDeg * 10.0f);
+        }
+        else
+        {
+            PARAMS_DBG("UpdateFromDevice: CMD_RTURN_GET_ANGLE_DEG failed, res=%d", (int)res);
+        }
+    }
+
+    /* 3. 从 dev_rturn 读取方向 -> 直接赋值 */
+    {
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_RTURN_GET_DIRECTION;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &u8Dir;
+        stcCmd.response_size = sizeof(uint8_t);
+
+        res = Device_Control(u8RTurnDevId, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            s16Direction = (int16_t)u8Dir;  /* 0=停止, 1=正转, 2=反转 */
+        }
+        else
+        {
+            PARAMS_DBG("UpdateFromDevice: CMD_RTURN_GET_DIRECTION failed, res=%d", (int)res);
+        }
+    }
+
+    /* 4. 从 dev_voltage 读取母线电压 (mV) -> 换算为 0.1V */
+    {
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_VOLTAGE_GET_BUS_MV;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &u32BusVoltageMv;
+        stcCmd.response_size = sizeof(uint32_t);
+
+        res = Device_Control(u8VoltageDevId, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            /* mV -> 0.1V: 0.1V = mV / 100 */
+            u16Voltage01 = (uint16_t)(u32BusVoltageMv / 100UL);
+        }
+        else
+        {
+            PARAMS_DBG("UpdateFromDevice: CMD_VOLTAGE_GET_BUS_MV failed, res=%d", (int)res);
+        }
+    }
+
+    /* 5. 从 dev_sensor 读取电流 (mA) -> 直接赋值 */
+    {
+        DeviceCommandData_t stcCmd;
+        memset(&stcCmd, 0, sizeof(DeviceCommandData_t));
+        stcCmd.cmd = CMD_SENSOR_GET_CURRENT_MA;
+        stcCmd.params = NULL;
+        stcCmd.param_size = 0;
+        stcCmd.response = &s32CurrentMa;
+        stcCmd.response_size = sizeof(int32_t);
+
+        res = Device_Control(u8SensorDevId, &stcCmd);
+        if (res == RESULT_OK)
+        {
+            /* mA 直接赋值，取绝对值（Modbus 为 uint16_t） */
+            if (s32CurrentMa < 0)
+            {
+                u16CurrentMa = (uint16_t)(-s32CurrentMa);
+            }
+            else
+            {
+                u16CurrentMa = (uint16_t)s32CurrentMa;
+            }
+        }
+        else
+        {
+            PARAMS_DBG("UpdateFromDevice: CMD_SENSOR_GET_CURRENT_MA failed, res=%d", (int)res);
+        }
+    }
+
+    /* 6. 更新到 g_RealTimeData */
+    g_RealTimeData.real_speed     = s16SpeedRpm;
+    g_RealTimeData.real_angle     = s16Angle01;
+    g_RealTimeData.real_direction = s16Direction;
+    g_RealTimeData.real_voltage   = u16Voltage01;
+    g_RealTimeData.real_current   = u16CurrentMa;
+
+    PARAMS_DBG("UpdateFromDevice: speed=%d r/min, angle=%d (0.1deg), dir=%d, "
+               "volt=%d (0.1V), curr=%d (mA)",
+               (int)s16SpeedRpm, (int)s16Angle01, (int)s16Direction,
+               (int)u16Voltage01, (int)u16CurrentMa);
+
+#else
+    /* 未启用 APP_PARAMS_USE_DEV_RTURN，空函数 */
+    (void)u8RTurnDevId;
+    (void)u8VoltageDevId;
+    (void)u8SensorDevId;
+#endif
+}
+
+/*=============================================================================
+ * @brief  打印实时数据（调试用）
+ *============================================================================*/
+void RealTime_PrintDebug(void)
+{
+#ifdef APP_REALTIME_DBG
+    MAIN_D("[REALTIME] speed=%d r/min, angle=%d (0.1deg), "
+           "voltage=%d (0.1V), current=%d (mA), dir=%d, "
+           "fault=0x%04X",
+           (int)g_RealTimeData.real_speed,
+           (int)g_RealTimeData.real_angle,
+           (int)g_RealTimeData.real_voltage,
+           (int)g_RealTimeData.real_current,
+           (int)g_RealTimeData.real_direction,
+           (unsigned int)g_RealTimeData.fault_status);
+#endif
+}
+
+/*=============================================================================
+ * @brief  实时数据模拟（每5秒各参数+1，用于测试上位机读取）
+ *============================================================================*/
+void RealTime_Simulate(void)
+{
+#ifdef APP_PARAMS_REALTIME_SIMULATE
+    static uint32_t s_u32LastSimTime = 0U;
+    uint32_t u32Now;
+
+    u32Now = tickTimer_GetCount();
+    if ((u32Now - s_u32LastSimTime) >= 5000U)
+    {
+        s_u32LastSimTime = u32Now;
+
+        /* 各参数 +1 */
+        g_RealTimeData.real_speed++;
+        g_RealTimeData.real_angle++;
+        g_RealTimeData.real_voltage++;
+        g_RealTimeData.real_current++;
+        g_RealTimeData.real_direction++;
+
+        /* 故障状态循环：每5秒切换一个故障位 */
+        g_RealTimeData.fault_status++;
+        if (g_RealTimeData.fault_status > 0x003FU)
+        {
+            g_RealTimeData.fault_status = 0U;
+        }
+
+        MAIN_D("[SIMULATE] realtime data +1 (for test)");
+    }
+#else
+    (void)0;
+#endif
+}
+
+/*=============================================================================
+ * @brief  初始化模拟实时数据
+ *============================================================================*/
+void SimRealtime_Init(void)
+{
+    g_SimRealtimeData.speed = 0;
+    g_SimRealtimeData.angle = 0;
+    g_SimRealtimeData.voltage = 240;    /* 24.0V */
+    g_SimRealtimeData.current = 0;
+    g_SimRealtimeData.direction = 1;
+    g_SimRealtimeData.fault_set = 0;
+    g_SimRealtimeData.fault_clear = 0;
+
+    SIM_DATA_DBG("SimRealtimeData init done");
+}
+
+/*=============================================================================
+ * @brief  同步模拟数据到实际实时数据（在主循环中调用）
+ *============================================================================*/
+void SimRealtime_Sync(void)
+{
+    int16_t  speed_val;
+    int16_t  angle_val;
+    uint16_t voltage_val;
+    uint16_t current_val;
+    int16_t  direction_val;
+    uint16_t fault_set_val;
+    uint16_t fault_clear_val;
+
+    /* 读取 volatile 变量到局部变量（确保一次性读取） */
+    speed_val     = g_SimRealtimeData.speed;
+    angle_val     = g_SimRealtimeData.angle;
+    voltage_val   = g_SimRealtimeData.voltage;
+    current_val   = g_SimRealtimeData.current;
+    direction_val = g_SimRealtimeData.direction;
+    fault_set_val = g_SimRealtimeData.fault_set;
+    fault_clear_val = g_SimRealtimeData.fault_clear;
+
+    /* 检查并同步转速 */
+    if (speed_val != s_lastSpeed) {
+        SIM_DATA_DBG("speed changed: %d -> %d r/min", (int)s_lastSpeed, (int)speed_val);
+        s_lastSpeed = speed_val;
+    }
+
+    /* 检查并同步角度 */
+    if (angle_val != s_lastAngle) {
+        SIM_DATA_DBG("angle changed: %d -> %d (0.1deg)", (int)s_lastAngle, (int)angle_val);
+        s_lastAngle = angle_val;
+    }
+
+    /* 检查并同步电压 */
+    if (voltage_val != s_lastVoltage) {
+        SIM_DATA_DBG("voltage changed: %d -> %d (0.1V)", (int)s_lastVoltage, (int)voltage_val);
+        s_lastVoltage = voltage_val;
+    }
+
+    /* 检查并同步电流 */
+    if (current_val != s_lastCurrent) {
+        SIM_DATA_DBG("current changed: %d -> %d mA", (int)s_lastCurrent, (int)current_val);
+        s_lastCurrent = current_val;
+    }
+
+    /* 检查并同步方向 */
+    if (direction_val != s_lastDirection) {
+        SIM_DATA_DBG("direction changed: %d -> %d", (int)s_lastDirection, (int)direction_val);
+        s_lastDirection = direction_val;
+    }
+
+    /* 同步普通实时数据（使用局部变量，非 volatile 指针） */
+    RealTime_Update(&speed_val, &angle_val, &voltage_val, &current_val, &direction_val);
+
+    /* 处理故障设置请求（写1设置故障） */
+    if (fault_set_val != 0) {
+        SIM_DATA_DBG("fault_set: 0x%04X", (unsigned int)fault_set_val);
+        RealTime_SetFault(fault_set_val);
+        g_SimRealtimeData.fault_set = 0;  /* 清零，表示已处理 */
+    }
+
+    /* 处理故障清除请求（写1清除故障） */
+    if (fault_clear_val != 0) {
+        SIM_DATA_DBG("fault_clear: 0x%04X", (unsigned int)fault_clear_val);
+        RealTime_ClearFault(fault_clear_val);
+        g_SimRealtimeData.fault_clear = 0;  /* 清零，表示已处理 */
+    }
+}
+
+/*=============================================================================
+ * @brief  打印模拟实时数据当前值（调试用）
+ *============================================================================*/
+void SimRealtime_PrintDebug(void)
+{
+    SIM_DATA_DBG("cur: speed=%d, angle=%d, volt=%d, curr=%d, dir=%d, fault=0x%04X",
+                 (int)g_SimRealtimeData.speed,
+                 (int)g_SimRealtimeData.angle,
+                 (int)g_SimRealtimeData.voltage,
+                 (int)g_SimRealtimeData.current,
+                 (int)g_SimRealtimeData.direction,
+                 (unsigned int)g_RealTimeData.fault_status);
+}

@@ -1,0 +1,979 @@
+ˇ˛#include "App_Modbus.h"
+#include "rs485.h"
+#include "msg_queue.h"
+#include "TickTimer.h"
+#include "param_manager.h"
+#include "App_Motor_Project.h"
+#include <string.h>
+#include "App_FaultHandler.h"
+#include "App_RunAngle.h"
+
+#include "param_validator.h"
+#include "param_validator.h"
+#include "App_Params.h"
+
+/*=============================================================================
+ * ÍÅ®R—SêMënˇŒN:g!j_ˇÿû§ãsQÌï	ˇ
+ * ;N:g;N®Rnè‚ãˇŒN:gNî^;N®R—Spenc
+ * ÇYóå’ãˇ÷Sàm rtt_manager.h -N APP_MODBUS_AUTO_DBG ÑvËl ë
+ * v^(W App_Modbus.h -N÷Sàm #define MODBUS_AUTO_SEND_ENABLE ÑvËl ë
+ *============================================================================*/
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    #define AUTO_SEND_INTERVAL_MS   (3000UL)
+    #define AUTO_SEND_MSG           "123\r\n"
+    #define AUTO_SEND_MSG_LEN       (5U)
+    static NonBlockingDelay_t m_stcAutoSendDelay;
+#endif
+
+/*=============================================================================
+ * oèˆNYMOˆ^ˆeMën
+ * ¬SpeôQeQ Flash TˇI{Ö_ÕTî^'^—Sêå[bˇçQgbLàoèˆNYMOO∞e¬SpeuHe
+ *============================================================================*/
+#define RESET_DELAY_MS              (200U)   /* YMOˆ^ˆe 100msˇnx›OÕTî^'^—Sêå[b */
+
+/*=============================================================================
+ * ¬SpeSbpShTgMën
+ *============================================================================*/
+#define PARAM_PRINT_INTERVAL_MS     (5000U)  /* œk5“ySbpSN!kMën¬Spe */
+
+/*=============================================================================
+ * Yó`ÿSœë
+ *============================================================================*/
+static uint8_t m_au8RespBuf[MODBUS_RESP_BUF_SIZE];  /* ÕTî^≤Q:S */
+static bool m_bResetPending = false;                 /* oèˆNYMOcwçh◊_ */
+static NonBlockingDelay_t m_stcResetDelay;           /* YMOˆ^ˆehV */
+static NonBlockingDelay_t m_stcParamPrintDelay;      /* ¬SpeSbpSˆ^ˆehV */
+
+/*=============================================================================
+ * param_manager Mën
+ *============================================================================*/
+static Param_Runtime_t m_stcParamRuntime;
+
+static const Param_Config_t m_stcParamConfig = {
+    .pParamBuf      = &g_AppParam,
+    .paramSize      = sizeof(AppParamRecord_t),
+    .magicHead      = PARAM_MAGIC_HEAD,
+    .magicTail      = PARAM_MAGIC_TAIL,
+    .checksumOffset = offsetof(AppParamRecord_t, checksum),
+    .seqOffset      = offsetof(AppParamRecord_t, sequence_id),
+    .eraseCntOffset = offsetof(AppParamRecord_t, erase_count),
+    .secStart        = 62,
+    .secEnd          = 56,
+};
+
+/*=============================================================================
+ * Yó`˝QpeXf
+ *============================================================================*/
+static uint16_t Modbus_CalcCrc16(const uint8_t *pData, uint16_t len);
+static void Modbus_SendResponse(uint8_t *pBuf, uint16_t len);
+static void Modbus_SendException(uint8_t addr, uint8_t func, uint8_t exceptionCode);
+static void Modbus_ProcessFrame(uint8_t *buf, uint16_t len);
+static void Modbus_HandleReadHolding(uint8_t addr, uint16_t startReg, uint16_t regCount);
+static void Modbus_HandleWriteSingle(uint8_t addr, uint16_t regAddr, uint16_t regValue);
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+static void Modbus_HandleWriteMulti(uint8_t addr, uint16_t startReg, uint16_t regCount, uint8_t *pData);
+#endif
+static void Modbus_UpdateRealtime(void);
+static void Modbus_PrintParams(void);
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    static void AutoSend_Process(void);
+#endif
+
+/*=============================================================================
+ * @brief  Modbus CRC16 °ãó{
+ *============================================================================*/
+static uint16_t Modbus_CalcCrc16(const uint8_t *pData, uint16_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    uint16_t i, j;
+
+    MODBUS_CRC_DBG("CRC calc start, len=%d", (int)len);
+
+    for (i = 0U; i < len; i++)
+    {
+        crc ^= pData[i];
+        MODBUS_CRC_DBG("  byte[%d]=0x%02X, crc=0x%04X", (int)i, pData[i], crc);
+        for (j = 0U; j < 8U; j++)
+        {
+            if (crc & 0x0001U)
+            {
+                crc >>= 1U;
+                crc ^= 0xA001U;
+            }
+            else
+            {
+                crc >>= 1U;
+            }
+        }
+        MODBUS_CRC_DBG("  after bit loop[%d], crc=0x%04X", (int)i, crc);
+    }
+
+    MODBUS_CRC_DBG("CRC calc done, result=0x%04X", crc);
+    return crc;
+}
+
+/*=============================================================================
+ * @brief  —Sê Modbus ÕTî^'^
+ *============================================================================*/
+static void Modbus_SendResponse(uint8_t *pBuf, uint16_t len)
+{
+    uint16_t crc;
+    bool     bRet;
+
+    /* °ãó{ CRC v^˝è†R0R'^>\ */
+    crc = Modbus_CalcCrc16(pBuf, len);
+    pBuf[len]       = (uint8_t)(crc & 0xFFU);          /* CRC NOW[ÇÇ */
+    pBuf[len + 1U]  = (uint8_t)((crc >> 8U) & 0xFFU); /* CRC ÿöW[ÇÇ */
+
+    MODBUS_POLL_DBG("send resp, len=%d, crc=0x%04X", (int)(len + 2U), crc);
+
+    bRet = RS485_Send(pBuf, len + 2U);
+    if (!bRet)
+    {
+        MAIN_D("[MODBUS_ERR] RS485_Send FAILED! len=%d", (int)(len + 2U));
+    }
+}
+
+/*=============================================================================
+ * @brief  —Sê Modbus _8^ÕTî^
+ *============================================================================*/
+static void Modbus_SendException(uint8_t addr, uint8_t func, uint8_t exceptionCode)
+{
+    m_au8RespBuf[0] = addr;                    /* ŒN:g0W@W */
+    m_au8RespBuf[1] = func | 0x80U;            /* _8^üR˝Äx = üSüR˝Äx + 0x80 */
+    m_au8RespBuf[2] = exceptionCode;           /* _8^x */
+
+    MODBUS_PARSE_DBG("send exception: addr=0x%02X, func=0x%02X, code=0x%02X",
+                     addr, func, exceptionCode);
+
+    Modbus_SendResponse(m_au8RespBuf, 3U);
+}
+
+/*=============================================================================
+ * @brief  ¿hÂgƒ[X[hV0W@W/f&T(W	gHeÉÙVÖQ
+ * @retval true  0W@W	gHe
+ * @retval false 0W@W‡eHe
+ *============================================================================*/
+static bool IsValidRegister(uint16_t regAddr)
+{
+    /* ¢[7bOSÆãö[INÑvƒ[X[hV0W@WÉÙVˇ0x2710 ~ 0x271E
+     * Ëlaˇ0W@WNﬁèÌ~ˇ0x2712 KNTÛç0R 0x2714ˇ0x2716 KNTÛç0R 0x271C
+     * ˘[éN*gö[INÑv0W@WˇÇY 0x271300x2717~0x271B00x271F	ˇˇ∆â:N›OYuƒ[X[hVˇ
+     * ‘èﬁV true v^‘èﬁV 0 <PˇêMQ;N:g˚ã÷SˆeÊâ—S_8^ÕTî^0
+     */
+    if ((regAddr >= 0x2710U) && (regAddr <= 0x271EU))
+    {
+        return true;
+    }
+
+    /* û[ˆepencƒ[X[hVÉÙVˇ0x2730 ~ 0x273300x273700x2740 */
+    if ((regAddr >= 0x2730U) && (regAddr <= 0x2733U))
+    {
+        return true;
+    }
+    if (regAddr == 0x2737U)
+    {
+        return true;
+    }
+    if (regAddr == 0x2740U)
+    {
+        return true;
+    }
+
+    switch (regAddr)
+    {
+    case REG_NODE_ID:
+    case REG_TARGET_SPEED:
+    case REG_TARGET_ANGLE:
+    case REG_VOLTAGE_UPPER_LIMIT:
+    case REG_VOLTAGE_LOWER_LIMIT:
+    case REG_CURRENT_UPPER_LIMIT:
+    case REG_CLOSE_LIMIT_ANGLE:
+    case REG_OPEN_LIMIT_ANGLE:
+    case REG_CURRENT_DETECT_MS:
+    case REG_MOTOR_HALL_DIR:
+    case REG_MOTOR_DIR:
+        case REG_RTURN_REDUCTION_RATIO:
+        case REG_MOTOR_HALL_POLE_PAIRS:
+        case REG_MOTOR_HALL_COUNT_LO:
+        case REG_MOTOR_HALL_COUNT_HI:
+        case REG_ABS_ANGLE_LO:
+        case REG_ABS_ANGLE_HI:
+        case REG_FLASH_ABS_LO:
+        case REG_FLASH_ABS_HI:
+        case REG_ABS_CMD:
+        case REG_ABS_THRESHOLD:
+        case REG_ABS_TARGET_LO:
+        case REG_ABS_TARGET_HI:
+        case REG_CALIB_UPPER_X10:
+        case REG_CALIB_LOWER_X10:
+        case REG_HEARTBEAT:
+    case REG_CTRL_CMD:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+/*=============================================================================
+ * @brief  Yt˚ã›Ocƒ[X[hV˜ãBl (üR˝Äx 0x03)
+ *
+ * ˜ãBl'^:  addr(1) + 0x03(1) + startReg_H(1) + startReg_L(1) + count_H(1) + count_L(1) + CRC(2)
+ * ÕTî^'^:  addr(1) + 0x03(1) + byteCount(1) + data(n) + CRC(2)
+ *============================================================================*/
+static void Modbus_HandleReadHolding(uint8_t addr, uint16_t startReg, uint16_t regCount)
+{
+    uint16_t i;
+    uint16_t regAddr;
+    uint16_t regValue;
+    uint16_t byteCount;
+    int32_t  ret;
+
+    MODBUS_PARSE_DBG("read holding: start=0x%04X, count=%d", startReg, (int)regCount);
+
+    /* Pñ6R˚ã÷Speœëˇ2ñbkÕTî^≤Q:S¢n˙Q */
+    if (regCount > 125U)
+    {
+        MODBUS_PARSE_DBG("  regCount too large: %d", (int)regCount);
+        Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+        return;
+    }
+
+    /* ¿hÂg@b	gƒ[X[hV0W@W/f&T	gHe */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+        if (!IsValidRegister(regAddr))
+        {
+            MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+            Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+            return;
+        }
+    }
+
+    /* Ñg˙^ÕTî^'^ */
+    byteCount = (uint16_t)(regCount * 2U);  /* œk*Nƒ[X[hV 2 W[ÇÇ */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_READ_HOLDING;
+    m_au8RespBuf[2] = (uint8_t)byteCount;
+
+    /* ê*N˚ã÷Sƒ[X[hV<P */
+        /* Pre-check: if writing target registers (0x2727+0x2728), verify gates
+
+     * BEFORE touching any register values. 
+     */
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        if (!Param_IsCtrlUnlocked())
+        {
+            MODBUS_PARSE_DBG("  goto-target blocked: RS485 control locked");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+        if (!Param_IsMotorStopped())
+        {
+            MODBUS_PARSE_DBG("  goto-target blocked: motor is running");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+    }
+
+for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+
+        ret = Param_ReadByReg(regAddr, &regValue);
+        if (ret != PARAM_OK)
+        {
+            MODBUS_PARSE_DBG("  Param_ReadByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+            Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+
+        /* Modbus 'YÔzè^ˇÿöW[ÇÇ(WMR */
+        m_au8RespBuf[3U + i * 2U]       = (uint8_t)((regValue >> 8U) & 0xFFU);   /* ÿöW[ÇÇ */
+        m_au8RespBuf[3U + i * 2U + 1U]  = (uint8_t)(regValue & 0xFFU);           /* NOW[ÇÇ */
+
+        MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X", regAddr, regValue);
+    }
+
+    MODBUS_PARSE_DBG("read holding done, byteCount=%d", (int)byteCount);
+
+    /* —SêÕTî^ (3 W[ÇÇ4YËê + penc) */
+    Modbus_SendResponse(m_au8RespBuf, 3U + byteCount);
+}
+
+/*=============================================================================
+ * @brief  YtôQUS*Nƒ[X[hV˜ãBl (üR˝Äx 0x06)
+ *
+ * ˜ãBl'^:  addr(1) + 0x06(1) + regAddr_H(1) + regAddr_L(1) + value_H(1) + value_L(1) + CRC(2)
+ * ÕTî^'^:  addr(1) + 0x06(1) + regAddr_H(1) + regAddr_L(1) + value_H(1) + value_L(1) + CRC(2)
+ *============================================================================*/
+static void Modbus_HandleWriteSingle(uint8_t addr, uint16_t regAddr, uint16_t regValue)
+{
+    int32_t ret;
+
+    MODBUS_PARSE_DBG("write single: reg=0x%04X, value=0x%04X", regAddr, regValue);
+
+    /* Handle absolute angle registers: 0x2725 (command), 0x2726 (threshold) */
+    if (regAddr == REG_ABS_CMD) {
+        RunAngle_Cmd(regValue);
+        /* Build echo response */
+        m_au8RespBuf[0] = addr;
+        m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+        m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+        m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+        m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+        m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+        Modbus_SendResponse(m_au8RespBuf, 6U);
+        return;
+    }
+
+    if (regAddr == REG_ABS_THRESHOLD) {
+        RunAngle_SetThreshold(regValue);
+        m_au8RespBuf[0] = addr;
+        m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+        m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+        m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+        m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+        m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+        Modbus_SendResponse(m_au8RespBuf, 6U);
+        return;
+    }
+
+    /* ¿hÂgƒ[X[hV0W@W/f&T	gHe */
+    if (!IsValidRegister(regAddr))
+    {
+        MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+        return;
+    }
+
+    /* ôQeQÖQX[ */
+    /* -- param validate: clamp -> round to step -- */
+    {
+        bool   bModified = false;
+        int32_t s32Validated = Param_Validate(regAddr, (int32_t)(int16_t)regValue, &bModified);
+        if (bModified) {
+            MODBUS_PARSE_DBG("  value validated: 0x%04X -> 0x%04lX", regValue, (unsigned long)s32Validated);
+        }
+        regValue = (uint16_t)s32Validated;
+    }
+
+    ret = Param_WriteByReg(regAddr, regValue);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_WriteByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    /* Ñg˙^ÕTî^'^ˇﬁV>f˜ãBlpenc	ˇ */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+    m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+    m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+    m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+    m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+
+    Modbus_SendResponse(m_au8RespBuf, 6U);
+
+    /* ÇYúg/fEeúñ∂r`ƒ[X[hVˇN›OX[ FlashˇNÊâ—SYMO */
+    if (regAddr == REG_FAULT_STATUS)
+    {
+        MODBUS_PARSE_DBG("write REG_FAULT_STATUS, skip Flash save and reset");
+        return;
+    }
+
+    /* ÇYúg/fßc6R}T‰Nƒ[X[hVˇN›OX[ FlashˇFO¿hÂg/f&TóÅâYMO */
+    if (regAddr == REG_CTRL_CMD)
+    {
+        MODBUS_PARSE_DBG("write REG_CTRL_CMD, skip Flash save");
+
+        /* ¿hÂg bit3ˇFAULT_BIT_RESET	ˇ/f&T´àæãnˇÇYúg/fRÊâ—SYMO */
+        if (regValue & FAULT_BIT_RESET)
+        {
+            MAIN_D("[MODBUS] REG_CTRL_CMD reset bit set, start reset delay %dms", (int)RESET_DELAY_MS);
+            m_bResetPending = true;
+            nbDelay_Start(&m_stcResetDelay);
+        }
+        return;
+    }
+
+    /* ÀzsS›OX[0R Flash */
+    ret = Param_Save(&m_stcParamConfig, &m_stcParamRuntime);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_Save failed, ret=%ld", (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("write single OK, saved to Flash");
+
+    /* ¬SpeMënå[bˇ/T®RYMOˆ^ˆe */
+    MAIN_D("[MODBUS] Param saved, hot-reload config %dms", (int)RESET_DELAY_MS);
+        App_ReloadConfig();
+        // nbDelay_Start(&m_stcResetDelay);  // no reset, using hot-reload
+}
+
+/*=============================================================================
+ * @brief  YtôQY*Nƒ[X[hV˜ãBl (üR˝Äx 0x10)
+ *
+ * ˜ãBl'^:  addr(1) + 0x10(1) + start_H(1) + start_L(1) + count_H(1) + count_L(1)
+ *          + byteCount(1) + data(n) + CRC(2)
+ * ÕTî^'^:  addr(1) + 0x10(1) + start_H(1) + start_L(1) + count_H(1) + count_L(1) + CRC(2)
+ *============================================================================*/
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+static void Modbus_HandleWriteMulti(uint8_t addr, uint16_t startReg, uint16_t regCount, uint8_t *pData)
+{
+    uint16_t i;
+    uint16_t regAddr;
+    uint16_t regValue;
+    int32_t  ret;
+    bool     bIsFaultStatus = false;  /* /f&TS+T REG_FAULT_STATUS */
+    bool     bIsCtrlCmd = false;      /* /f&TS+T REG_CTRL_CMD */
+    bool     bResetRequested = false; /* /f&TÊâ—SÜNYMO˜ãBl */
+
+    MAIN_D("[GTGT] 0x10 enter: start=0x%04X count=%d", startReg, (int)regCount);
+        MODBUS_PARSE_DBG("write multi: start=0x%04X, count=%d", startReg, (int)regCount);
+
+    /* Pñ6RôQeQpeœë */
+    if ((regCount == 0U) || (regCount > 123U))
+    {
+        MODBUS_PARSE_DBG("  invalid regCount: %d", (int)regCount);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+        return;
+    }
+
+    /* ¿hÂg@b	gƒ[X[hV0W@W/f&T	gHe */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+        if (!IsValidRegister(regAddr))
+        {
+            MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+            return;
+        }
+        /* ¿hÂg/f&TS+T REG_FAULT_STATUS */
+        if (regAddr == REG_FAULT_STATUS)
+        {
+            bIsFaultStatus = true;
+        }
+        /* ¿hÂg/f&TS+T REG_CTRL_CMD */
+        if (regAddr == REG_CTRL_CMD)
+        {
+            bIsCtrlCmd = true;
+        }
+    }
+
+    MAIN_D("[GTGT] pre-check: cover=%d", (int)(startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO));
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        if (!Param_IsCtrlUnlocked())
+        {
+            MAIN_D("[GTGT] blocked: ctrl locked");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+        if (!Param_IsMotorStopped())
+        {
+            MAIN_D("[GTGT] blocked: motor running");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+    }
+
+    /* ê*NôQeQƒ[X[hVˇHQôQeQÖQX[ˇgTﬂ~N›OX[	ˇ */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+
+        /* Modbus 'YÔzè^ˇÿöW[ÇÇ(WMR */
+        regValue = ((uint16_t)pData[i * 2U] << 8U) | (uint16_t)pData[i * 2U + 1U];
+
+        /* Handle absolute angle registers: bypass normal Param_WriteByReg */
+        if (regAddr == REG_ABS_CMD)
+        {
+            RunAngle_Cmd(regValue);
+            MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X (abs cmd)", regAddr, regValue);
+            continue;
+        }
+        if (regAddr == REG_ABS_THRESHOLD)
+        {
+            RunAngle_SetThreshold(regValue);
+            MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X (abs thresh)", regAddr, regValue);
+            continue;
+        }
+
+        ret = Param_WriteByReg(regAddr, regValue);
+        if (ret != PARAM_OK)
+        {
+            MODBUS_PARSE_DBG("  Param_WriteByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+
+        MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X", regAddr, regValue);
+
+        /* ÇYúg/f REG_CTRL_CMDˇ¿hÂg/f&TæãnÜNYMOMO */
+        if (regAddr == REG_CTRL_CMD)
+        {
+            if (regValue & FAULT_BIT_RESET)
+            {
+                bResetRequested = true;
+            }
+        }
+
+        /* Handle absolute angle command in multi-write */
+        if (regAddr == REG_ABS_CMD)
+        {
+            RunAngle_Cmd(regValue);
+        }
+    }
+
+    MAIN_D("[GTGT] write done, triggering GotoTarget");
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        RunAngle_GotoTarget();
+    }
+
+    /* After multi-write loop: if both 0x2727+0x2728 were written, trigger goto-target.
+     * The target value has already been stored by Param_WriteByReg above. */
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        RunAngle_GotoTarget();
+    }
+
+    /* Ñg˙^ÕTî^'^ */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_WRITE_MULTI;
+    m_au8RespBuf[2] = (uint8_t)((startReg >> 8U) & 0xFFU);     /* wçÀY0W@WÿöW[ÇÇ */
+    m_au8RespBuf[3] = (uint8_t)(startReg & 0xFFU);              /* wçÀY0W@WNOW[ÇÇ */
+    m_au8RespBuf[4] = (uint8_t)((regCount >> 8U) & 0xFFU);     /* ƒ[X[hVpeœëÿöW[ÇÇ */
+    m_au8RespBuf[5] = (uint8_t)(regCount & 0xFFU);              /* ƒ[X[hVpeœëNOW[ÇÇ */
+
+    Modbus_SendResponse(m_au8RespBuf, 6U);
+
+    /* ÇYúgS+T REG_FAULT_STATUSˇN›OX[ FlashˇNÊâ—SYMO */
+    if (bIsFaultStatus)
+    {
+        MODBUS_PARSE_DBG("write multi contains REG_FAULT_STATUS, skip Flash save and reset");
+        return;
+    }
+
+    /* ÇYúgS+T REG_CTRL_CMDˇN›OX[ FlashˇFO¿hÂg/f&TóÅâYMO */
+    if (bIsCtrlCmd)
+    {
+        MODBUS_PARSE_DBG("write multi contains REG_CTRL_CMD, skip Flash save");
+        
+        /* ÇYúgÊâ—SÜNYMO˜ãBlˇ/T®RYMOˆ^ˆe */
+        if (bResetRequested)
+        {
+            MAIN_D("[MODBUS] REG_CTRL_CMD reset bit set in multi write, start reset delay %dms", (int)RESET_DELAY_MS);
+            m_bResetPending = true;
+            nbDelay_Start(&m_stcResetDelay);
+        }
+        return;
+    }
+
+    /* hQËêôQeQbüRTˇﬂ~N›OX[0R Flash */
+    ret = Param_Save(&m_stcParamConfig, &m_stcParamRuntime);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_Save failed, ret=%ld", (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("write multi done, all saved to Flash");
+
+    /* ¬SpeMënå[bˇ/T®RYMOˆ^ˆe */
+    MAIN_D("[MODBUS] Param saved, hot-reload config %dms", (int)RESET_DELAY_MS);
+        App_ReloadConfig();
+        // nbDelay_Start(&m_stcResetDelay);  // no reset, using hot-reload
+}
+#endif
+/*=============================================================================
+ * @brief  Modbus '^YtˇŒN:g!j_	ˇ
+ *============================================================================*/
+static void Modbus_ProcessFrame(uint8_t *buf, uint16_t len)
+{
+    uint16_t crcCalc;
+    uint16_t crcRecv;
+    uint8_t  addr;
+    uint8_t  func;
+    uint16_t dataLen;
+
+    MODBUS_RX_DBG("frame recv, len=%d", (int)len);
+
+    /* SbpSüSÀY'^W[ÇÇ */
+    {
+        uint16_t i;
+        for (i = 0; i < len; i++)
+        {
+            MODBUS_RX_DBG("  buf[%d]=0x%02X", (int)i, buf[i]);
+        }
+    }
+
+    /* ¿hÂgg\'^ï¶^ */
+    if (len < MODBUS_FRAME_FIX_LEN)
+    {
+        MODBUS_PARSE_DBG("frame too short, len=%d < min=%d", (int)len, (int)MODBUS_FRAME_FIX_LEN);
+        return;
+    }
+
+    /* –c÷SW[µk */
+    addr = buf[0];
+    func = buf[1];
+    dataLen = len - 4U;  /* addr(1) + func(1) + crc(2) */
+
+    MODBUS_PARSE_DBG("addr=0x%02X, func=0x%02X, dataLen=%d", addr, func, (int)dataLen);
+
+    /* ¿hÂgŒN:g0W@W/f&T9SMë */
+    /* Check address: allow broadcast 0x00 for heartbeat (0x271F) read */
+    bool bIsBroadcastHeartbeat = false;
+    if (addr == 0x00U && func == MODBUS_FUNC_READ_HOLDING
+        && dataLen >= 4U)
+    {
+        uint16_t u16StartReg = ((uint16_t)buf[2] << 8U) | buf[3];
+        uint16_t u16RegCount = ((uint16_t)buf[4] << 8U) | buf[5];
+        if (u16StartReg == REG_HEARTBEAT && u16RegCount == 1U)
+        {
+            bIsBroadcastHeartbeat = true;
+        }
+    }
+
+    if (addr != g_AppParam.node_id && !bIsBroadcastHeartbeat)
+    {
+        MODBUS_PARSE_DBG("  addr mismatch: recv=0x%02X, local=0x%02X", addr, g_AppParam.node_id);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("addr match OK, node_id=0x%02X, broadcast=%d",
+                     g_AppParam.node_id, (int)bIsBroadcastHeartbeat);
+
+    /* –c÷S•c6e0RÑv CRC (\Ôzè^ˇNOW[ÇÇ(WMR) */
+    crcRecv = (uint16_t)(buf[len - 1U] << 8U) | buf[len - 2U];
+    MODBUS_CRC_DBG("recv CRC=0x%04X (low=0x%02X, high=0x%02X)",
+                   crcRecv, buf[len - 2U], buf[len - 1U]);
+
+    /* °ãó{ CRC (addr + func + data) */
+    crcCalc = Modbus_CalcCrc16(buf, len - 2U);
+    MODBUS_CRC_DBG("calc CRC=0x%04X", crcCalc);
+
+    if (crcCalc != crcRecv)
+    {
+        MODBUS_CRC_DBG("CRC mismatch! calc=0x%04X, recv=0x%04X, addr=0x%02X, func=0x%02X",
+                       crcCalc, crcRecv, addr, func);
+        return;
+    }
+
+    MODBUS_CRC_DBG("CRC match OK, addr=0x%02X, func=0x%02X", addr, func);
+
+    /* === ‡eagˆNSbpSˇnx§ã CRC !håöê«èv^€èeQ switch === */
+    MAIN_D("[MODBUS_ENTRY] CRC OK! addr=0x%02X, func=0x%02X, entering switch", addr, func);
+
+    /* 9hncüR˝ÄxR—SYt */
+    switch (func)
+    {
+    case MODBUS_FUNC_READ_HOLDING:
+    {
+        /* ˜ãBl: addr(1) + 0x03(1) + startReg(2) + count(2) + CRC(2) */
+        if (dataLen < 4U)
+        {
+            MODBUS_PARSE_DBG("  -> read holding: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t startReg = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regCount = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            Modbus_HandleReadHolding(addr, startReg, regCount);
+        }
+        break;
+    }
+
+    case MODBUS_FUNC_WRITE_SINGLE:
+    {
+        /* ˜ãBl: addr(1) + 0x06(1) + regAddr(2) + value(2) + CRC(2) */
+        if (dataLen < 4U)
+        {
+            MODBUS_PARSE_DBG("  -> write single: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t regAddr  = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regValue = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            Modbus_HandleWriteSingle(addr, regAddr, regValue);
+        }
+        break;
+    }
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+    case MODBUS_FUNC_WRITE_MULTI:
+    {
+        /* ˜ãBl: addr(1) + 0x10(1) + start(2) + count(2) + byteCount(1) + data(n) + CRC(2) */
+        if (dataLen < 5U)
+        {
+            MODBUS_PARSE_DBG("  -> write multi: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t startReg  = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regCount  = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            uint8_t  byteCount = buf[6];
+            uint8_t *pRegData  = &buf[7];
+
+            /* åö¡ãW[ÇÇpe */
+            if ((uint16_t)byteCount != (regCount * 2U))
+            {
+                MODBUS_PARSE_DBG("  -> byteCount mismatch: %d != %d", byteCount, regCount * 2U);
+                Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+                break;
+            }
+
+            Modbus_HandleWriteMulti(addr, startReg, regCount, pRegData);
+        }
+        break;
+    }
+#endif
+    default:
+        /* N/ecÑvüR˝Äx */
+        MODBUS_PARSE_DBG("  unsupported func: 0x%02X", func);
+        Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_FUNC);
+        break;
+    }
+}
+
+/*=============================================================================
+ * @brief  ÍÅ®R—SêYt˝QpeˇŒN:g!j_ˇÿû§ãsQÌï	ˇ
+ *============================================================================*/
+#ifdef MODBUS_AUTO_SEND_ENABLE
+static void AutoSend_Process(void)
+{
+    if (nbDelay_IsComplete(&m_stcAutoSendDelay))
+    {
+        MODBUS_AUTO_DBG("trigger, msg=%s, len=%d", AUTO_SEND_MSG, (int)AUTO_SEND_MSG_LEN);
+        RS485_Send((uint8_t*)AUTO_SEND_MSG, AUTO_SEND_MSG_LEN);
+        nbDelay_Start(&m_stcAutoSendDelay);
+        MODBUS_AUTO_DBG("next send in %dms", (int)AUTO_SEND_INTERVAL_MS);
+    }
+}
+#endif
+
+/*=============================================================================
+ * @brief  Ùf∞eû[ˆepenc
+ *         9hnc APP_PARAMS_USE_DEV_RTURN è[	êÈbpencegênˇ
+ *         - ö[INÂãè[ˇŒN dev_rturn æãY˚ã÷Sû[Eñpenc
+ *         - *gö[INÂãè[ˇO(u SimRealtimeDataˇKeil Debug (Wø~ÓO9e	ˇ
+ *============================================================================*/
+static void Modbus_UpdateRealtime(void)
+{
+#ifdef APP_PARAMS_USE_DEV_RTURN
+    /* ŒNæãY˚ã÷Sû[ˆepenc
+     * ID_RTURN      = 15 (dev_rturn, lèê/“â¶^/πeT)
+     * ID_VOLTAGE_BUS = 13 (dev_voltage, 5uãS)
+     * ID_SENSOR_CURRENT = 14 (dev_sensor, 5uAm)
+     */
+    RealTime_UpdateFromDevice(ID_RTURN, ID_VOLTAGE_BUS, ID_SENSOR_CURRENT);
+#else
+    /* Tek!jﬂbpenc0Rû[ˆepencˇ(uéN Keil Debug (Wø~ÓO9e	ˇ */
+    SimRealtime_Sync();
+#endif
+
+    /* û[ˆepenc!jﬂbˇóÅâ APP_PARAMS_REALTIME_SIMULATE è[	ˇ */
+    RealTime_Simulate();
+}
+
+/*=============================================================================
+ * @brief  SbpSMën¬Speˇœk5“y	ˇ
+ *         1u APP_MODBUS_PARAM_PRINT è[ßc6R_sQ
+ *============================================================================*/
+static void Modbus_PrintParams(void)
+{
+    if (nbDelay_IsComplete(&m_stcParamPrintDelay))
+    {
+        nbDelay_Start(&m_stcParamPrintDelay);
+
+        /* 5uãSˇ0.1V lèbc:N V ÑvtepeËêRåT\peËêR */
+        uint16_t voltage_upper_int = g_AppParam.voltage_upper_limit / 10;
+        uint16_t voltage_upper_frac = g_AppParam.voltage_upper_limit % 10;
+        uint16_t voltage_lower_int = g_AppParam.voltage_lower_limit / 10;
+        uint16_t voltage_lower_frac = g_AppParam.voltage_lower_limit % 10;
+
+        /* 5uAmˇ1mA lèbc:N A ÑvtepeËêRåT\peËêRˇ\peπpT3MO	ˇ */
+        uint32_t current_upper_ma = g_AppParam.current_upper_limit;
+        uint32_t current_upper_int = current_upper_ma / 1000;
+        uint32_t current_upper_frac = current_upper_ma % 1000;
+
+        /* ëb6R*g_(ufãJTˇÿSœë≈N(W MODBUS_PARAM_PRINT è[-NO(u	ˇ */
+        (void)voltage_upper_int;
+        (void)voltage_upper_frac;
+        (void)voltage_lower_int;
+        (void)voltage_lower_frac;
+        (void)current_upper_int;
+        (void)current_upper_frac;
+
+        MODBUS_PARAM_PRINT("node_id=%d, speed=%dr/min, angle=%d(0.1deg), "
+            "volt_upper=%d(=%d.%dV), volt_lower=%d(=%d.%dV), "
+            "curr_upper=%dmA(=%d.%03dA), "
+            "curr_detect=%dms, "
+            "close_angle=%d(0.1deg), open_angle=%d(0.1deg)",
+            (int)g_AppParam.node_id,
+            (int)g_AppParam.target_speed,
+            (int)g_AppParam.target_angle,
+            (int)g_AppParam.voltage_upper_limit,
+            (int)voltage_upper_int,
+            (int)voltage_upper_frac,
+            (int)g_AppParam.voltage_lower_limit,
+            (int)voltage_lower_int,
+            (int)voltage_lower_frac,
+            (int)g_AppParam.current_upper_limit,
+            (int)current_upper_int,
+            (int)current_upper_frac,
+            (int)g_AppParam.current_detect_ms,
+            (int)g_AppParam.close_limit_angle,
+            (int)g_AppParam.open_limit_angle);
+
+        /* û[ˆepencå’ãSbpSˇóÅâ APP_PARAMS_REALTIME_DBG è[	ˇ */
+#ifdef APP_PARAMS_REALTIME_DBG
+        RealTime_PrintDebug();
+#endif
+
+        /* SbpS!jﬂbpencS_MR<Pˇ≈N(W*g/T(u dev_rturn ˆeSbpS	ˇ */
+#ifndef APP_PARAMS_USE_DEV_RTURN
+#ifdef APP_PARAMS_SIM_DBG
+        SimRealtime_PrintDebug();
+#endif
+#endif
+    }
+}
+
+/*=============================================================================
+ * @brief  æãn¬Speÿû§ã<PˇõO param_manager ﬁVåO(u	ˇ
+ *============================================================================*/
+void Modbus_SetParamDefaults(void)
+{
+    memset(&g_AppParam, 0, sizeof(AppParamRecord_t));
+    g_AppParam.head_magic = PARAM_MAGIC_HEAD;
+    g_AppParam.tail_magic = PARAM_MAGIC_TAIL;
+
+    /* ¢[7b Modbus OSÆã¬Speÿû§ã<Pˇ¥f2óŸ~ Modbus	ˇ */
+    g_AppParam.node_id               = (uint16_t)PARAM_DEFAULT_NODE_ID;
+    g_AppParam.target_speed          = (int16_t)PARAM_DEFAULT_TARGET_SPEED;
+    g_AppParam.target_angle          = (int16_t)PARAM_DEFAULT_TARGET_ANGLE;
+    g_AppParam.voltage_upper_limit   = (uint16_t)PARAM_DEFAULT_VOLTAGE_UPPER_LIMIT;
+    g_AppParam.voltage_lower_limit   = (uint16_t)PARAM_DEFAULT_VOLTAGE_LOWER_LIMIT;
+    g_AppParam.current_upper_limit   = (uint16_t)PARAM_DEFAULT_CURRENT_UPPER_LIMIT;
+    g_AppParam.current_detect_ms     = (uint16_t)PARAM_DEFAULT_CURRENT_DETECT_MS;
+    g_AppParam.close_limit_angle     = (int16_t)PARAM_DEFAULT_CLOSE_LIMIT_ANGLE;
+    g_AppParam.open_limit_angle      = (int16_t)PARAM_DEFAULT_OPEN_LIMIT_ANGLE;
+    g_AppParam.baud_rate             = PARAM_DEFAULT_BAUD_RATE;
+
+    /* ÖQËê¬Speÿû§ã<PˇN¥f2óŸ~ Modbusˇ≈N Flash X[®P	ˇ */
+    g_AppParam.voltage_upper_hysteresis   = (uint16_t)PARAM_DEFAULT_VOLTAGE_UPPER_HYSTERESIS;
+    g_AppParam.voltage_lower_hysteresis   = (uint16_t)PARAM_DEFAULT_VOLTAGE_LOWER_HYSTERESIS;
+    g_AppParam.overvoltage_trigger_count  = (uint8_t)PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT;
+    g_AppParam.undervoltage_trigger_count = (uint8_t)PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
+    g_AppParam.current_hysteresis_ma      = (uint16_t)PARAM_DEFAULT_CURRENT_HYSTERESIS_MA;
+    g_AppParam.current_release_ms         = (uint16_t)PARAM_DEFAULT_CURRENT_RELEASE_MS;
+    g_AppParam.overcurrent_trigger_count  = (uint8_t)PARAM_DEFAULT_OVERCURRENT_TRIGGER_CNT;
+    g_AppParam.motor_hall_dir            = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_DIR;
+    g_AppParam.motor_dir                 = (uint16_t)PARAM_DEFAULT_MOTOR_DIR;
+    g_AppParam.rturn_reduction_ratio     = (uint16_t)PARAM_DEFAULT_RTURN_REDUCTION_RATIO;
+    g_AppParam.motor_hall_pole_pairs     = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_POLE_PAIRS;
+    g_AppParam.calib_upper_x10            = (int16_t)PARAM_DEFAULT_CALIB_UPPER_X10;
+    g_AppParam.calib_lower_x10            = (int16_t)PARAM_DEFAULT_CALIB_LOWER_X10;
+    
+    /* ›OYuW[ÇÇnˆñ */
+
+    g_AppParam.tail_magic = PARAM_MAGIC_TAIL;
+}
+
+/*=============================================================================
+ * @brief  Modbus RÀYS
+ *============================================================================*/
+/*=============================================================================
+ * @brief  Modbus RÀYS
+ *============================================================================*/
+void Modbus_Init(void)
+{
+    /* RÀYS¬Spe°{thVˇŒN Flash †R}è¬Speˇbæãnÿû§ã<Pv^ôQeQ Flash	ˇ */
+    Param_Init(&m_stcParamConfig, &m_stcParamRuntime, Modbus_SetParamDefaults);
+    /* ¿hÂg∞eûXW[µk/f&TóÅâRÀYSˇ”~ÑgSOibU\TÑv|Qπ[Yt	ˇ */
+    if (g_AppParam.rturn_reduction_ratio == 0 || g_AppParam.motor_hall_pole_pairs == 0)
+    {
+        g_AppParam.rturn_reduction_ratio = (uint16_t)PARAM_DEFAULT_RTURN_REDUCTION_RATIO;
+        g_AppParam.motor_hall_pole_pairs = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_POLE_PAIRS;
+        Param_Save(&m_stcParamConfig, &m_stcParamRuntime);  // :_6R›OX[∞eÿû§ã<P0RFlash
+        // MAIN_D: new fields set to defaults
+    }
+
+    /* RÀYS!jﬂbû[ˆepenc */
+    SimRealtime_Init();
+
+    /* ndñ@b	gEeúñ */
+    RealTime_ClearFault(FAULT_BIT_OVERVOLTAGE | FAULT_BIT_OVERCURRENT | 
+                        FAULT_BIT_OVERTEMP | FAULT_BIT_RESET |
+                        FAULT_BIT_OVERLOAD | FAULT_BIT_STALL | FAULT_BIT_UNDERVOLTAGE);
+
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    nbDelay_Init(&m_stcAutoSendDelay, AUTO_SEND_INTERVAL_MS);
+    nbDelay_Start(&m_stcAutoSendDelay);
+    MODBUS_INIT_DBG("done, autoSendInterval=%dms, autoSendMsg=%s, autoSendLen=%d",
+                    AUTO_SEND_INTERVAL_MS, AUTO_SEND_MSG, AUTO_SEND_MSG_LEN);
+#else
+    MODBUS_INIT_DBG("done (slave mode, auto send disabled)");
+#endif
+
+    /* RÀYSYMOˆ^ˆehV */
+    nbDelay_Init(&m_stcResetDelay, RESET_DELAY_MS);
+    m_bResetPending = false;
+
+    /* RÀYS¬SpeSbpSˆ^ˆehV */
+    nbDelay_Init(&m_stcParamPrintDelay, PARAM_PRINT_INTERVAL_MS);
+    nbDelay_Start(&m_stcParamPrintDelay);
+
+    // /* RÀYSEeúñYthVˇ¢ãñ5uãS/5uAmãNˆNˇÙf∞eEeúñx	ˇ */
+    // FaultHandler_Init();
+
+    MAIN_D("System ready - modify g_SimRealtimeData in Keil Watch");
+}
+
+/*=============================================================================
+ * @brief  Modbus ;N™_Øsnè‚ã
+ *============================================================================*/
+void Modbus_Poll(void)
+{
+    msg_t rxFrame;
+
+    /* 1. Ùf∞eû[ˆepencˇ9hncè[	êÈbegênˇæãYb!jﬂb	ˇ */
+    Modbus_UpdateRealtime();
+
+    /* 2. ŒN RS485 ñR•c6e'^v^Yt */
+    if (MsgQueue_Receive(RS485_GetRxFrameQueue(), &rxFrame, 0, "Modbus_Poll"))
+    {
+        MODBUS_POLL_DBG("dequeue frame, len=%d, type=0x%02X", rxFrame.len, rxFrame.type);
+        Modbus_ProcessFrame(rxFrame.data, rxFrame.len);
+    }
+
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    /* 3. ÍÅ®R—Sêˇå’ã(uˇŒN:g!j_ÿû§ãsQÌï	ˇ */
+    AutoSend_Process();
+#endif
+
+    /* 4. ¿hÂgYMOˆ^ˆe/f&Tå[bˇå[bRgbLàoèˆNYMO */
+    if (m_bResetPending && nbDelay_IsComplete(&m_stcResetDelay))
+    {
+        MAIN_D("[MODBUS] Reset delay done, system reset now!");
+        m_bResetPending = false;
+        __NVIC_SystemReset();
+    }
+
+    /* 5. œk5“ySbpSMën¬Speˇ1u APP_MODBUS_PARAM_PRINT è[ßc6R	ˇ */
+    Modbus_PrintParams();
+}

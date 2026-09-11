@@ -1,0 +1,979 @@
+﻿#include "App_Modbus.h"
+#include "rs485.h"
+#include "msg_queue.h"
+#include "TickTimer.h"
+#include "param_manager.h"
+#include "App_Motor_Project.h"
+#include <string.h>
+#include "App_FaultHandler.h"
+#include "App_RunAngle.h"
+
+#include "param_validator.h"
+#include "param_validator.h"
+#include "App_Params.h"
+
+/*=============================================================================
+ * 自动发送配置（从机模式，默认关闭）
+ * 主机主动轮询，从机不应主动发数据
+ * 如需调试，取消 rtt_manager.h 中 APP_MODBUS_AUTO_DBG 的注释
+ * 并在 App_Modbus.h 中取消 #define MODBUS_AUTO_SEND_ENABLE 的注释
+ *============================================================================*/
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    #define AUTO_SEND_INTERVAL_MS   (3000UL)
+    #define AUTO_SEND_MSG           "123\r\n"
+    #define AUTO_SEND_MSG_LEN       (5U)
+    static NonBlockingDelay_t m_stcAutoSendDelay;
+#endif
+
+/*=============================================================================
+ * 软件复位延时配置
+ * 参数写入 Flash 后，等待响应帧发送完成，再执行软件复位使新参数生效
+ *============================================================================*/
+#define RESET_DELAY_MS              (200U)   /* 复位延时 100ms，确保响应帧发送完成 */
+
+/*=============================================================================
+ * 参数打印周期配置
+ *============================================================================*/
+#define PARAM_PRINT_INTERVAL_MS     (5000U)  /* 每5秒打印一次配置参数 */
+
+/*=============================================================================
+ * 静态变量
+ *============================================================================*/
+static uint8_t m_au8RespBuf[MODBUS_RESP_BUF_SIZE];  /* 响应缓冲区 */
+static bool m_bResetPending = false;                 /* 软件复位挂起标志 */
+static NonBlockingDelay_t m_stcResetDelay;           /* 复位延时器 */
+static NonBlockingDelay_t m_stcParamPrintDelay;      /* 参数打印延时器 */
+
+/*=============================================================================
+ * param_manager 配置
+ *============================================================================*/
+static Param_Runtime_t m_stcParamRuntime;
+
+static const Param_Config_t m_stcParamConfig = {
+    .pParamBuf      = &g_AppParam,
+    .paramSize      = sizeof(AppParamRecord_t),
+    .magicHead      = PARAM_MAGIC_HEAD,
+    .magicTail      = PARAM_MAGIC_TAIL,
+    .checksumOffset = offsetof(AppParamRecord_t, checksum),
+    .seqOffset      = offsetof(AppParamRecord_t, sequence_id),
+    .eraseCntOffset = offsetof(AppParamRecord_t, erase_count),
+    .secStart        = 62,
+    .secEnd          = 56,
+};
+
+/*=============================================================================
+ * 静态函数声明
+ *============================================================================*/
+static uint16_t Modbus_CalcCrc16(const uint8_t *pData, uint16_t len);
+static void Modbus_SendResponse(uint8_t *pBuf, uint16_t len);
+static void Modbus_SendException(uint8_t addr, uint8_t func, uint8_t exceptionCode);
+static void Modbus_ProcessFrame(uint8_t *buf, uint16_t len);
+static void Modbus_HandleReadHolding(uint8_t addr, uint16_t startReg, uint16_t regCount);
+static void Modbus_HandleWriteSingle(uint8_t addr, uint16_t regAddr, uint16_t regValue);
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+static void Modbus_HandleWriteMulti(uint8_t addr, uint16_t startReg, uint16_t regCount, uint8_t *pData);
+#endif
+static void Modbus_UpdateRealtime(void);
+static void Modbus_PrintParams(void);
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    static void AutoSend_Process(void);
+#endif
+
+/*=============================================================================
+ * @brief  Modbus CRC16 计算
+ *============================================================================*/
+static uint16_t Modbus_CalcCrc16(const uint8_t *pData, uint16_t len)
+{
+    uint16_t crc = 0xFFFFU;
+    uint16_t i, j;
+
+    MODBUS_CRC_DBG("CRC calc start, len=%d", (int)len);
+
+    for (i = 0U; i < len; i++)
+    {
+        crc ^= pData[i];
+        MODBUS_CRC_DBG("  byte[%d]=0x%02X, crc=0x%04X", (int)i, pData[i], crc);
+        for (j = 0U; j < 8U; j++)
+        {
+            if (crc & 0x0001U)
+            {
+                crc >>= 1U;
+                crc ^= 0xA001U;
+            }
+            else
+            {
+                crc >>= 1U;
+            }
+        }
+        MODBUS_CRC_DBG("  after bit loop[%d], crc=0x%04X", (int)i, crc);
+    }
+
+    MODBUS_CRC_DBG("CRC calc done, result=0x%04X", crc);
+    return crc;
+}
+
+/*=============================================================================
+ * @brief  发送 Modbus 响应帧
+ *============================================================================*/
+static void Modbus_SendResponse(uint8_t *pBuf, uint16_t len)
+{
+    uint16_t crc;
+    bool     bRet;
+
+    /* 计算 CRC 并追加到帧尾 */
+    crc = Modbus_CalcCrc16(pBuf, len);
+    pBuf[len]       = (uint8_t)(crc & 0xFFU);          /* CRC 低字节 */
+    pBuf[len + 1U]  = (uint8_t)((crc >> 8U) & 0xFFU); /* CRC 高字节 */
+
+    MODBUS_POLL_DBG("send resp, len=%d, crc=0x%04X", (int)(len + 2U), crc);
+
+    bRet = RS485_Send(pBuf, len + 2U);
+    if (!bRet)
+    {
+        MAIN_D("[MODBUS_ERR] RS485_Send FAILED! len=%d", (int)(len + 2U));
+    }
+}
+
+/*=============================================================================
+ * @brief  发送 Modbus 异常响应
+ *============================================================================*/
+static void Modbus_SendException(uint8_t addr, uint8_t func, uint8_t exceptionCode)
+{
+    m_au8RespBuf[0] = addr;                    /* 从机地址 */
+    m_au8RespBuf[1] = func | 0x80U;            /* 异常功能码 = 原功能码 + 0x80 */
+    m_au8RespBuf[2] = exceptionCode;           /* 异常码 */
+
+    MODBUS_PARSE_DBG("send exception: addr=0x%02X, func=0x%02X, code=0x%02X",
+                     addr, func, exceptionCode);
+
+    Modbus_SendResponse(m_au8RespBuf, 3U);
+}
+
+/*=============================================================================
+ * @brief  检查寄存器地址是否在有效范围内
+ * @retval true  地址有效
+ * @retval false 地址无效
+ *============================================================================*/
+static bool IsValidRegister(uint16_t regAddr)
+{
+    /* 客户协议定义的寄存器地址范围：0x2710 ~ 0x271E
+     * 注意：地址不连续！0x2712 之后跳到 0x2714，0x2716 之后跳到 0x271C
+     * 对于未定义的地址（如 0x2713、0x2717~0x271B、0x271F），视为保留寄存器，
+     * 返回 true 并返回 0 值，避免主机读取时触发异常响应。
+     */
+    if ((regAddr >= 0x2710U) && (regAddr <= 0x271EU))
+    {
+        return true;
+    }
+
+    /* 实时数据寄存器范围：0x2730 ~ 0x2733、0x2737、0x2740 */
+    if ((regAddr >= 0x2730U) && (regAddr <= 0x2733U))
+    {
+        return true;
+    }
+    if (regAddr == 0x2737U)
+    {
+        return true;
+    }
+    if (regAddr == 0x2740U)
+    {
+        return true;
+    }
+
+    switch (regAddr)
+    {
+    case REG_NODE_ID:
+    case REG_TARGET_SPEED:
+    case REG_TARGET_ANGLE:
+    case REG_VOLTAGE_UPPER_LIMIT:
+    case REG_VOLTAGE_LOWER_LIMIT:
+    case REG_CURRENT_UPPER_LIMIT:
+    case REG_CLOSE_LIMIT_ANGLE:
+    case REG_OPEN_LIMIT_ANGLE:
+    case REG_CURRENT_DETECT_MS:
+    case REG_MOTOR_HALL_DIR:
+    case REG_MOTOR_DIR:
+        case REG_RTURN_REDUCTION_RATIO:
+        case REG_MOTOR_HALL_POLE_PAIRS:
+        case REG_MOTOR_HALL_COUNT_LO:
+        case REG_MOTOR_HALL_COUNT_HI:
+        case REG_ABS_ANGLE_LO:
+        case REG_ABS_ANGLE_HI:
+        case REG_FLASH_ABS_LO:
+        case REG_FLASH_ABS_HI:
+        case REG_ABS_CMD:
+        case REG_ABS_THRESHOLD:
+        case REG_ABS_TARGET_LO:
+        case REG_ABS_TARGET_HI:
+        case REG_CALIB_UPPER_X10:
+        case REG_CALIB_LOWER_X10:
+        case REG_HEARTBEAT:
+    case REG_CTRL_CMD:
+        return true;
+
+    default:
+        return false;
+    }
+}
+
+/*=============================================================================
+ * @brief  处理读保持寄存器请求 (功能码 0x03)
+ *
+ * 请求帧:  addr(1) + 0x03(1) + startReg_H(1) + startReg_L(1) + count_H(1) + count_L(1) + CRC(2)
+ * 响应帧:  addr(1) + 0x03(1) + byteCount(1) + data(n) + CRC(2)
+ *============================================================================*/
+static void Modbus_HandleReadHolding(uint8_t addr, uint16_t startReg, uint16_t regCount)
+{
+    uint16_t i;
+    uint16_t regAddr;
+    uint16_t regValue;
+    uint16_t byteCount;
+    int32_t  ret;
+
+    MODBUS_PARSE_DBG("read holding: start=0x%04X, count=%d", startReg, (int)regCount);
+
+    /* 限制读取数量，防止响应缓冲区溢出 */
+    if (regCount > 125U)
+    {
+        MODBUS_PARSE_DBG("  regCount too large: %d", (int)regCount);
+        Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+        return;
+    }
+
+    /* 检查所有寄存器地址是否有效 */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+        if (!IsValidRegister(regAddr))
+        {
+            MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+            Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+            return;
+        }
+    }
+
+    /* 构建响应帧 */
+    byteCount = (uint16_t)(regCount * 2U);  /* 每个寄存器 2 字节 */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_READ_HOLDING;
+    m_au8RespBuf[2] = (uint8_t)byteCount;
+
+    /* 逐个读取寄存器值 */
+        /* Pre-check: if writing target registers (0x2727+0x2728), verify gates
+
+     * BEFORE touching any register values. 
+     */
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        if (!Param_IsCtrlUnlocked())
+        {
+            MODBUS_PARSE_DBG("  goto-target blocked: RS485 control locked");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+        if (!Param_IsMotorStopped())
+        {
+            MODBUS_PARSE_DBG("  goto-target blocked: motor is running");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+    }
+
+for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+
+        ret = Param_ReadByReg(regAddr, &regValue);
+        if (ret != PARAM_OK)
+        {
+            MODBUS_PARSE_DBG("  Param_ReadByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+            Modbus_SendException(addr, MODBUS_FUNC_READ_HOLDING, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+
+        /* Modbus 大端序：高字节在前 */
+        m_au8RespBuf[3U + i * 2U]       = (uint8_t)((regValue >> 8U) & 0xFFU);   /* 高字节 */
+        m_au8RespBuf[3U + i * 2U + 1U]  = (uint8_t)(regValue & 0xFFU);           /* 低字节 */
+
+        MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X", regAddr, regValue);
+    }
+
+    MODBUS_PARSE_DBG("read holding done, byteCount=%d", (int)byteCount);
+
+    /* 发送响应 (3 字节头部 + 数据) */
+    Modbus_SendResponse(m_au8RespBuf, 3U + byteCount);
+}
+
+/*=============================================================================
+ * @brief  处理写单个寄存器请求 (功能码 0x06)
+ *
+ * 请求帧:  addr(1) + 0x06(1) + regAddr_H(1) + regAddr_L(1) + value_H(1) + value_L(1) + CRC(2)
+ * 响应帧:  addr(1) + 0x06(1) + regAddr_H(1) + regAddr_L(1) + value_H(1) + value_L(1) + CRC(2)
+ *============================================================================*/
+static void Modbus_HandleWriteSingle(uint8_t addr, uint16_t regAddr, uint16_t regValue)
+{
+    int32_t ret;
+
+    MODBUS_PARSE_DBG("write single: reg=0x%04X, value=0x%04X", regAddr, regValue);
+
+    /* Handle absolute angle registers: 0x2725 (command), 0x2726 (threshold) */
+    if (regAddr == REG_ABS_CMD) {
+        RunAngle_Cmd(regValue);
+        /* Build echo response */
+        m_au8RespBuf[0] = addr;
+        m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+        m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+        m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+        m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+        m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+        Modbus_SendResponse(m_au8RespBuf, 6U);
+        return;
+    }
+
+    if (regAddr == REG_ABS_THRESHOLD) {
+        RunAngle_SetThreshold(regValue);
+        m_au8RespBuf[0] = addr;
+        m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+        m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+        m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+        m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+        m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+        Modbus_SendResponse(m_au8RespBuf, 6U);
+        return;
+    }
+
+    /* 检查寄存器地址是否有效 */
+    if (!IsValidRegister(regAddr))
+    {
+        MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+        return;
+    }
+
+    /* 写入内存 */
+    /* -- param validate: clamp -> round to step -- */
+    {
+        bool   bModified = false;
+        int32_t s32Validated = Param_Validate(regAddr, (int32_t)(int16_t)regValue, &bModified);
+        if (bModified) {
+            MODBUS_PARSE_DBG("  value validated: 0x%04X -> 0x%04lX", regValue, (unsigned long)s32Validated);
+        }
+        regValue = (uint16_t)s32Validated;
+    }
+
+    ret = Param_WriteByReg(regAddr, regValue);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_WriteByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    /* 构建响应帧（回显请求数据） */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_WRITE_SINGLE;
+    m_au8RespBuf[2] = (uint8_t)((regAddr >> 8U) & 0xFFU);
+    m_au8RespBuf[3] = (uint8_t)(regAddr & 0xFFU);
+    m_au8RespBuf[4] = (uint8_t)((regValue >> 8U) & 0xFFU);
+    m_au8RespBuf[5] = (uint8_t)(regValue & 0xFFU);
+
+    Modbus_SendResponse(m_au8RespBuf, 6U);
+
+    /* 如果是故障状态寄存器，不保存 Flash，不触发复位 */
+    if (regAddr == REG_FAULT_STATUS)
+    {
+        MODBUS_PARSE_DBG("write REG_FAULT_STATUS, skip Flash save and reset");
+        return;
+    }
+
+    /* 如果是控制命令寄存器，不保存 Flash，但检查是否需要复位 */
+    if (regAddr == REG_CTRL_CMD)
+    {
+        MODBUS_PARSE_DBG("write REG_CTRL_CMD, skip Flash save");
+
+        /* 检查 bit3（FAULT_BIT_RESET）是否被设置，如果是则触发复位 */
+        if (regValue & FAULT_BIT_RESET)
+        {
+            MAIN_D("[MODBUS] REG_CTRL_CMD reset bit set, start reset delay %dms", (int)RESET_DELAY_MS);
+            m_bResetPending = true;
+            nbDelay_Start(&m_stcResetDelay);
+        }
+        return;
+    }
+
+    /* 立即保存到 Flash */
+    ret = Param_Save(&m_stcParamConfig, &m_stcParamRuntime);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_Save failed, ret=%ld", (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_SINGLE, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("write single OK, saved to Flash");
+
+    /* 参数配置完成，启动复位延时 */
+    MAIN_D("[MODBUS] Param saved, hot-reload config %dms", (int)RESET_DELAY_MS);
+        App_ReloadConfig();
+        // nbDelay_Start(&m_stcResetDelay);  // no reset, using hot-reload
+}
+
+/*=============================================================================
+ * @brief  处理写多个寄存器请求 (功能码 0x10)
+ *
+ * 请求帧:  addr(1) + 0x10(1) + start_H(1) + start_L(1) + count_H(1) + count_L(1)
+ *          + byteCount(1) + data(n) + CRC(2)
+ * 响应帧:  addr(1) + 0x10(1) + start_H(1) + start_L(1) + count_H(1) + count_L(1) + CRC(2)
+ *============================================================================*/
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+static void Modbus_HandleWriteMulti(uint8_t addr, uint16_t startReg, uint16_t regCount, uint8_t *pData)
+{
+    uint16_t i;
+    uint16_t regAddr;
+    uint16_t regValue;
+    int32_t  ret;
+    bool     bIsFaultStatus = false;  /* 是否包含 REG_FAULT_STATUS */
+    bool     bIsCtrlCmd = false;      /* 是否包含 REG_CTRL_CMD */
+    bool     bResetRequested = false; /* 是否触发了复位请求 */
+
+    MAIN_D("[GTGT] 0x10 enter: start=0x%04X count=%d", startReg, (int)regCount);
+        MODBUS_PARSE_DBG("write multi: start=0x%04X, count=%d", startReg, (int)regCount);
+
+    /* 限制写入数量 */
+    if ((regCount == 0U) || (regCount > 123U))
+    {
+        MODBUS_PARSE_DBG("  invalid regCount: %d", (int)regCount);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+        return;
+    }
+
+    /* 检查所有寄存器地址是否有效 */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+        if (!IsValidRegister(regAddr))
+        {
+            MODBUS_PARSE_DBG("  invalid reg addr: 0x%04X", regAddr);
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_ILLEGAL_DATA_ADDR);
+            return;
+        }
+        /* 检查是否包含 REG_FAULT_STATUS */
+        if (regAddr == REG_FAULT_STATUS)
+        {
+            bIsFaultStatus = true;
+        }
+        /* 检查是否包含 REG_CTRL_CMD */
+        if (regAddr == REG_CTRL_CMD)
+        {
+            bIsCtrlCmd = true;
+        }
+    }
+
+    MAIN_D("[GTGT] pre-check: cover=%d", (int)(startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO));
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        if (!Param_IsCtrlUnlocked())
+        {
+            MAIN_D("[GTGT] blocked: ctrl locked");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+        if (!Param_IsMotorStopped())
+        {
+            MAIN_D("[GTGT] blocked: motor running");
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+    }
+
+    /* 逐个写入寄存器（先写入内存，最后统一保存） */
+    for (i = 0U; i < regCount; i++)
+    {
+        regAddr = startReg + i;
+
+        /* Modbus 大端序：高字节在前 */
+        regValue = ((uint16_t)pData[i * 2U] << 8U) | (uint16_t)pData[i * 2U + 1U];
+
+        /* Handle absolute angle registers: bypass normal Param_WriteByReg */
+        if (regAddr == REG_ABS_CMD)
+        {
+            RunAngle_Cmd(regValue);
+            MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X (abs cmd)", regAddr, regValue);
+            continue;
+        }
+        if (regAddr == REG_ABS_THRESHOLD)
+        {
+            RunAngle_SetThreshold(regValue);
+            MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X (abs thresh)", regAddr, regValue);
+            continue;
+        }
+
+        ret = Param_WriteByReg(regAddr, regValue);
+        if (ret != PARAM_OK)
+        {
+            MODBUS_PARSE_DBG("  Param_WriteByReg failed: reg=0x%04X, ret=%ld", regAddr, (long)ret);
+            Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+            return;
+        }
+
+        MODBUS_PARSE_DBG("  reg[0x%04X]=0x%04X", regAddr, regValue);
+
+        /* 如果是 REG_CTRL_CMD，检查是否设置了复位位 */
+        if (regAddr == REG_CTRL_CMD)
+        {
+            if (regValue & FAULT_BIT_RESET)
+            {
+                bResetRequested = true;
+            }
+        }
+
+        /* Handle absolute angle command in multi-write */
+        if (regAddr == REG_ABS_CMD)
+        {
+            RunAngle_Cmd(regValue);
+        }
+    }
+
+    MAIN_D("[GTGT] write done, triggering GotoTarget");
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        RunAngle_GotoTarget();
+    }
+
+    /* After multi-write loop: if both 0x2727+0x2728 were written, trigger goto-target.
+     * The target value has already been stored by Param_WriteByReg above. */
+    if (startReg <= REG_ABS_TARGET_LO && (startReg + regCount) > REG_ABS_TARGET_LO)
+    {
+        RunAngle_GotoTarget();
+    }
+
+    /* 构建响应帧 */
+    m_au8RespBuf[0] = addr;
+    m_au8RespBuf[1] = MODBUS_FUNC_WRITE_MULTI;
+    m_au8RespBuf[2] = (uint8_t)((startReg >> 8U) & 0xFFU);     /* 起始地址高字节 */
+    m_au8RespBuf[3] = (uint8_t)(startReg & 0xFFU);              /* 起始地址低字节 */
+    m_au8RespBuf[4] = (uint8_t)((regCount >> 8U) & 0xFFU);     /* 寄存器数量高字节 */
+    m_au8RespBuf[5] = (uint8_t)(regCount & 0xFFU);              /* 寄存器数量低字节 */
+
+    Modbus_SendResponse(m_au8RespBuf, 6U);
+
+    /* 如果包含 REG_FAULT_STATUS，不保存 Flash，不触发复位 */
+    if (bIsFaultStatus)
+    {
+        MODBUS_PARSE_DBG("write multi contains REG_FAULT_STATUS, skip Flash save and reset");
+        return;
+    }
+
+    /* 如果包含 REG_CTRL_CMD，不保存 Flash，但检查是否需要复位 */
+    if (bIsCtrlCmd)
+    {
+        MODBUS_PARSE_DBG("write multi contains REG_CTRL_CMD, skip Flash save");
+        
+        /* 如果触发了复位请求，启动复位延时 */
+        if (bResetRequested)
+        {
+            MAIN_D("[MODBUS] REG_CTRL_CMD reset bit set in multi write, start reset delay %dms", (int)RESET_DELAY_MS);
+            m_bResetPending = true;
+            nbDelay_Start(&m_stcResetDelay);
+        }
+        return;
+    }
+
+    /* 全部写入成功后，统一保存到 Flash */
+    ret = Param_Save(&m_stcParamConfig, &m_stcParamRuntime);
+    if (ret != PARAM_OK)
+    {
+        MODBUS_PARSE_DBG("  Param_Save failed, ret=%ld", (long)ret);
+        Modbus_SendException(addr, MODBUS_FUNC_WRITE_MULTI, MODBUS_EXCEPTION_SLAVE_DEVICE_FAIL);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("write multi done, all saved to Flash");
+
+    /* 参数配置完成，启动复位延时 */
+    MAIN_D("[MODBUS] Param saved, hot-reload config %dms", (int)RESET_DELAY_MS);
+        App_ReloadConfig();
+        // nbDelay_Start(&m_stcResetDelay);  // no reset, using hot-reload
+}
+#endif
+/*=============================================================================
+ * @brief  Modbus 帧处理（从机模式）
+ *============================================================================*/
+static void Modbus_ProcessFrame(uint8_t *buf, uint16_t len)
+{
+    uint16_t crcCalc;
+    uint16_t crcRecv;
+    uint8_t  addr;
+    uint8_t  func;
+    uint16_t dataLen;
+
+    MODBUS_RX_DBG("frame recv, len=%d", (int)len);
+
+    /* 打印原始帧字节 */
+    {
+        uint16_t i;
+        for (i = 0; i < len; i++)
+        {
+            MODBUS_RX_DBG("  buf[%d]=0x%02X", (int)i, buf[i]);
+        }
+    }
+
+    /* 检查最小帧长度 */
+    if (len < MODBUS_FRAME_FIX_LEN)
+    {
+        MODBUS_PARSE_DBG("frame too short, len=%d < min=%d", (int)len, (int)MODBUS_FRAME_FIX_LEN);
+        return;
+    }
+
+    /* 提取字段 */
+    addr = buf[0];
+    func = buf[1];
+    dataLen = len - 4U;  /* addr(1) + func(1) + crc(2) */
+
+    MODBUS_PARSE_DBG("addr=0x%02X, func=0x%02X, dataLen=%d", addr, func, (int)dataLen);
+
+    /* 检查从机地址是否匹配 */
+    /* Check address: allow broadcast 0x00 for heartbeat (0x271F) read */
+    bool bIsBroadcastHeartbeat = false;
+    if (addr == 0x00U && func == MODBUS_FUNC_READ_HOLDING
+        && dataLen >= 4U)
+    {
+        uint16_t u16StartReg = ((uint16_t)buf[2] << 8U) | buf[3];
+        uint16_t u16RegCount = ((uint16_t)buf[4] << 8U) | buf[5];
+        if (u16StartReg == REG_HEARTBEAT && u16RegCount == 1U)
+        {
+            bIsBroadcastHeartbeat = true;
+        }
+    }
+
+    if (addr != g_AppParam.node_id && !bIsBroadcastHeartbeat)
+    {
+        MODBUS_PARSE_DBG("  addr mismatch: recv=0x%02X, local=0x%02X", addr, g_AppParam.node_id);
+        return;
+    }
+
+    MODBUS_PARSE_DBG("addr match OK, node_id=0x%02X, broadcast=%d",
+                     g_AppParam.node_id, (int)bIsBroadcastHeartbeat);
+
+    /* 提取接收到的 CRC (小端序：低字节在前) */
+    crcRecv = (uint16_t)(buf[len - 1U] << 8U) | buf[len - 2U];
+    MODBUS_CRC_DBG("recv CRC=0x%04X (low=0x%02X, high=0x%02X)",
+                   crcRecv, buf[len - 2U], buf[len - 1U]);
+
+    /* 计算 CRC (addr + func + data) */
+    crcCalc = Modbus_CalcCrc16(buf, len - 2U);
+    MODBUS_CRC_DBG("calc CRC=0x%04X", crcCalc);
+
+    if (crcCalc != crcRecv)
+    {
+        MODBUS_CRC_DBG("CRC mismatch! calc=0x%04X, recv=0x%04X, addr=0x%02X, func=0x%02X",
+                       crcCalc, crcRecv, addr, func);
+        return;
+    }
+
+    MODBUS_CRC_DBG("CRC match OK, addr=0x%02X, func=0x%02X", addr, func);
+
+    /* === 无条件打印：确认 CRC 校验通过并进入 switch === */
+    MAIN_D("[MODBUS_ENTRY] CRC OK! addr=0x%02X, func=0x%02X, entering switch", addr, func);
+
+    /* 根据功能码分发处理 */
+    switch (func)
+    {
+    case MODBUS_FUNC_READ_HOLDING:
+    {
+        /* 请求: addr(1) + 0x03(1) + startReg(2) + count(2) + CRC(2) */
+        if (dataLen < 4U)
+        {
+            MODBUS_PARSE_DBG("  -> read holding: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t startReg = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regCount = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            Modbus_HandleReadHolding(addr, startReg, regCount);
+        }
+        break;
+    }
+
+    case MODBUS_FUNC_WRITE_SINGLE:
+    {
+        /* 请求: addr(1) + 0x06(1) + regAddr(2) + value(2) + CRC(2) */
+        if (dataLen < 4U)
+        {
+            MODBUS_PARSE_DBG("  -> write single: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t regAddr  = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regValue = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            Modbus_HandleWriteSingle(addr, regAddr, regValue);
+        }
+        break;
+    }
+#ifdef MODBUS_ENABLE_WRITE_MULTI
+    case MODBUS_FUNC_WRITE_MULTI:
+    {
+        /* 请求: addr(1) + 0x10(1) + start(2) + count(2) + byteCount(1) + data(n) + CRC(2) */
+        if (dataLen < 5U)
+        {
+            MODBUS_PARSE_DBG("  -> write multi: data too short");
+            Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+            break;
+        }
+        {
+            uint16_t startReg  = ((uint16_t)buf[2] << 8U) | (uint16_t)buf[3];
+            uint16_t regCount  = ((uint16_t)buf[4] << 8U) | (uint16_t)buf[5];
+            uint8_t  byteCount = buf[6];
+            uint8_t *pRegData  = &buf[7];
+
+            /* 验证字节数 */
+            if ((uint16_t)byteCount != (regCount * 2U))
+            {
+                MODBUS_PARSE_DBG("  -> byteCount mismatch: %d != %d", byteCount, regCount * 2U);
+                Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_DATA_VAL);
+                break;
+            }
+
+            Modbus_HandleWriteMulti(addr, startReg, regCount, pRegData);
+        }
+        break;
+    }
+#endif
+    default:
+        /* 不支持的功能码 */
+        MODBUS_PARSE_DBG("  unsupported func: 0x%02X", func);
+        Modbus_SendException(addr, func, MODBUS_EXCEPTION_ILLEGAL_FUNC);
+        break;
+    }
+}
+
+/*=============================================================================
+ * @brief  自动发送处理函数（从机模式，默认关闭）
+ *============================================================================*/
+#ifdef MODBUS_AUTO_SEND_ENABLE
+static void AutoSend_Process(void)
+{
+    if (nbDelay_IsComplete(&m_stcAutoSendDelay))
+    {
+        MODBUS_AUTO_DBG("trigger, msg=%s, len=%d", AUTO_SEND_MSG, (int)AUTO_SEND_MSG_LEN);
+        RS485_Send((uint8_t*)AUTO_SEND_MSG, AUTO_SEND_MSG_LEN);
+        nbDelay_Start(&m_stcAutoSendDelay);
+        MODBUS_AUTO_DBG("next send in %dms", (int)AUTO_SEND_INTERVAL_MS);
+    }
+}
+#endif
+
+/*=============================================================================
+ * @brief  更新实时数据
+ *         根据 APP_PARAMS_USE_DEV_RTURN 宏选择数据来源：
+ *         - 定义该宏：从 dev_rturn 设备读取实际数据
+ *         - 未定义该宏：使用 SimRealtimeData（Keil Debug 在线修改）
+ *============================================================================*/
+static void Modbus_UpdateRealtime(void)
+{
+#ifdef APP_PARAMS_USE_DEV_RTURN
+    /* 从设备读取实时数据
+     * ID_RTURN      = 15 (dev_rturn, 转速/角度/方向)
+     * ID_VOLTAGE_BUS = 13 (dev_voltage, 电压)
+     * ID_SENSOR_CURRENT = 14 (dev_sensor, 电流)
+     */
+    RealTime_UpdateFromDevice(ID_RTURN, ID_VOLTAGE_BUS, ID_SENSOR_CURRENT);
+#else
+    /* 同步模拟数据到实时数据（用于 Keil Debug 在线修改） */
+    SimRealtime_Sync();
+#endif
+
+    /* 实时数据模拟（需要 APP_PARAMS_REALTIME_SIMULATE 宏） */
+    RealTime_Simulate();
+}
+
+/*=============================================================================
+ * @brief  打印配置参数（每5秒）
+ *         由 APP_MODBUS_PARAM_PRINT 宏控制开关
+ *============================================================================*/
+static void Modbus_PrintParams(void)
+{
+    if (nbDelay_IsComplete(&m_stcParamPrintDelay))
+    {
+        nbDelay_Start(&m_stcParamPrintDelay);
+
+        /* 电压：0.1V 转换为 V 的整数部分和小数部分 */
+        uint16_t voltage_upper_int = g_AppParam.voltage_upper_limit / 10;
+        uint16_t voltage_upper_frac = g_AppParam.voltage_upper_limit % 10;
+        uint16_t voltage_lower_int = g_AppParam.voltage_lower_limit / 10;
+        uint16_t voltage_lower_frac = g_AppParam.voltage_lower_limit % 10;
+
+        /* 电流：1mA 转换为 A 的整数部分和小数部分（小数点后3位） */
+        uint32_t current_upper_ma = g_AppParam.current_upper_limit;
+        uint32_t current_upper_int = current_upper_ma / 1000;
+        uint32_t current_upper_frac = current_upper_ma % 1000;
+
+        /* 抑制未引用警告（变量仅在 MODBUS_PARAM_PRINT 宏中使用） */
+        (void)voltage_upper_int;
+        (void)voltage_upper_frac;
+        (void)voltage_lower_int;
+        (void)voltage_lower_frac;
+        (void)current_upper_int;
+        (void)current_upper_frac;
+
+        MODBUS_PARAM_PRINT("node_id=%d, speed=%dr/min, angle=%d(0.1deg), "
+            "volt_upper=%d(=%d.%dV), volt_lower=%d(=%d.%dV), "
+            "curr_upper=%dmA(=%d.%03dA), "
+            "curr_detect=%dms, "
+            "close_angle=%d(0.1deg), open_angle=%d(0.1deg)",
+            (int)g_AppParam.node_id,
+            (int)g_AppParam.target_speed,
+            (int)g_AppParam.target_angle,
+            (int)g_AppParam.voltage_upper_limit,
+            (int)voltage_upper_int,
+            (int)voltage_upper_frac,
+            (int)g_AppParam.voltage_lower_limit,
+            (int)voltage_lower_int,
+            (int)voltage_lower_frac,
+            (int)g_AppParam.current_upper_limit,
+            (int)current_upper_int,
+            (int)current_upper_frac,
+            (int)g_AppParam.current_detect_ms,
+            (int)g_AppParam.close_limit_angle,
+            (int)g_AppParam.open_limit_angle);
+
+        /* 实时数据调试打印（需要 APP_PARAMS_REALTIME_DBG 宏） */
+#ifdef APP_PARAMS_REALTIME_DBG
+        RealTime_PrintDebug();
+#endif
+
+        /* 打印模拟数据当前值（仅在未启用 dev_rturn 时打印） */
+#ifndef APP_PARAMS_USE_DEV_RTURN
+#ifdef APP_PARAMS_SIM_DBG
+        SimRealtime_PrintDebug();
+#endif
+#endif
+    }
+}
+
+/*=============================================================================
+ * @brief  设置参数默认值（供 param_manager 回调使用）
+ *============================================================================*/
+void Modbus_SetParamDefaults(void)
+{
+    memset(&g_AppParam, 0, sizeof(AppParamRecord_t));
+    g_AppParam.head_magic = PARAM_MAGIC_HEAD;
+    g_AppParam.tail_magic = PARAM_MAGIC_TAIL;
+
+    /* 客户 Modbus 协议参数默认值（暴露给 Modbus） */
+    g_AppParam.node_id               = (uint16_t)PARAM_DEFAULT_NODE_ID;
+    g_AppParam.target_speed          = (int16_t)PARAM_DEFAULT_TARGET_SPEED;
+    g_AppParam.target_angle          = (int16_t)PARAM_DEFAULT_TARGET_ANGLE;
+    g_AppParam.voltage_upper_limit   = (uint16_t)PARAM_DEFAULT_VOLTAGE_UPPER_LIMIT;
+    g_AppParam.voltage_lower_limit   = (uint16_t)PARAM_DEFAULT_VOLTAGE_LOWER_LIMIT;
+    g_AppParam.current_upper_limit   = (uint16_t)PARAM_DEFAULT_CURRENT_UPPER_LIMIT;
+    g_AppParam.current_detect_ms     = (uint16_t)PARAM_DEFAULT_CURRENT_DETECT_MS;
+    g_AppParam.close_limit_angle     = (int16_t)PARAM_DEFAULT_CLOSE_LIMIT_ANGLE;
+    g_AppParam.open_limit_angle      = (int16_t)PARAM_DEFAULT_OPEN_LIMIT_ANGLE;
+    g_AppParam.baud_rate             = PARAM_DEFAULT_BAUD_RATE;
+
+    /* 内部参数默认值（不暴露给 Modbus，仅 Flash 存储） */
+    g_AppParam.voltage_upper_hysteresis   = (uint16_t)PARAM_DEFAULT_VOLTAGE_UPPER_HYSTERESIS;
+    g_AppParam.voltage_lower_hysteresis   = (uint16_t)PARAM_DEFAULT_VOLTAGE_LOWER_HYSTERESIS;
+    g_AppParam.overvoltage_trigger_count  = (uint8_t)PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT;
+    g_AppParam.undervoltage_trigger_count = (uint8_t)PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
+    g_AppParam.current_hysteresis_ma      = (uint16_t)PARAM_DEFAULT_CURRENT_HYSTERESIS_MA;
+    g_AppParam.current_release_ms         = (uint16_t)PARAM_DEFAULT_CURRENT_RELEASE_MS;
+    g_AppParam.overcurrent_trigger_count  = (uint8_t)PARAM_DEFAULT_OVERCURRENT_TRIGGER_CNT;
+    g_AppParam.motor_hall_dir            = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_DIR;
+    g_AppParam.motor_dir                 = (uint16_t)PARAM_DEFAULT_MOTOR_DIR;
+    g_AppParam.rturn_reduction_ratio     = (uint16_t)PARAM_DEFAULT_RTURN_REDUCTION_RATIO;
+    g_AppParam.motor_hall_pole_pairs     = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_POLE_PAIRS;
+    g_AppParam.calib_upper_x10            = (int16_t)PARAM_DEFAULT_CALIB_UPPER_X10;
+    g_AppParam.calib_lower_x10            = (int16_t)PARAM_DEFAULT_CALIB_LOWER_X10;
+    
+    /* 保留字节清零 */
+
+    g_AppParam.tail_magic = PARAM_MAGIC_TAIL;
+}
+
+/*=============================================================================
+ * @brief  Modbus 初始化
+ *============================================================================*/
+/*=============================================================================
+ * @brief  Modbus 初始化
+ *============================================================================*/
+void Modbus_Init(void)
+{
+    /* 初始化参数管理器（从 Flash 加载参数，或设置默认值并写入 Flash） */
+    Param_Init(&m_stcParamConfig, &m_stcParamRuntime, Modbus_SetParamDefaults);
+    /* 检查新增字段是否需要初始化（结构体扩展后的兼容处理） */
+    if (g_AppParam.rturn_reduction_ratio == 0 || g_AppParam.motor_hall_pole_pairs == 0)
+    {
+        g_AppParam.rturn_reduction_ratio = (uint16_t)PARAM_DEFAULT_RTURN_REDUCTION_RATIO;
+        g_AppParam.motor_hall_pole_pairs = (uint16_t)PARAM_DEFAULT_MOTOR_HALL_POLE_PAIRS;
+        Param_Save(&m_stcParamConfig, &m_stcParamRuntime);  // 强制保存新默认值到Flash
+        // MAIN_D: new fields set to defaults
+    }
+
+    /* 初始化模拟实时数据 */
+    SimRealtime_Init();
+
+    /* 清除所有故障 */
+    RealTime_ClearFault(FAULT_BIT_OVERVOLTAGE | FAULT_BIT_OVERCURRENT_FWD | 
+                        FAULT_BIT_OVERCURRENT_REV | FAULT_BIT_RESET |
+                        FAULT_BIT_OVERLOAD | FAULT_BIT_STALL | FAULT_BIT_UNDERVOLTAGE);
+
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    nbDelay_Init(&m_stcAutoSendDelay, AUTO_SEND_INTERVAL_MS);
+    nbDelay_Start(&m_stcAutoSendDelay);
+    MODBUS_INIT_DBG("done, autoSendInterval=%dms, autoSendMsg=%s, autoSendLen=%d",
+                    AUTO_SEND_INTERVAL_MS, AUTO_SEND_MSG, AUTO_SEND_MSG_LEN);
+#else
+    MODBUS_INIT_DBG("done (slave mode, auto send disabled)");
+#endif
+
+    /* 初始化复位延时器 */
+    nbDelay_Init(&m_stcResetDelay, RESET_DELAY_MS);
+    m_bResetPending = false;
+
+    /* 初始化参数打印延时器 */
+    nbDelay_Init(&m_stcParamPrintDelay, PARAM_PRINT_INTERVAL_MS);
+    nbDelay_Start(&m_stcParamPrintDelay);
+
+    // /* 初始化故障处理器（订阅电压/电流事件，更新故障码） */
+    // FaultHandler_Init();
+
+    MAIN_D("System ready - modify g_SimRealtimeData in Keil Watch");
+}
+
+/*=============================================================================
+ * @brief  Modbus 主循环轮询
+ *============================================================================*/
+void Modbus_Poll(void)
+{
+    msg_t rxFrame;
+
+    /* 1. 更新实时数据（根据宏选择来源：设备或模拟） */
+    Modbus_UpdateRealtime();
+
+    /* 2. 从 RS485 队列接收帧并处理 */
+    if (MsgQueue_Receive(RS485_GetRxFrameQueue(), &rxFrame, 0, "Modbus_Poll"))
+    {
+        MODBUS_POLL_DBG("dequeue frame, len=%d, type=0x%02X", rxFrame.len, rxFrame.type);
+        Modbus_ProcessFrame(rxFrame.data, rxFrame.len);
+    }
+
+#ifdef MODBUS_AUTO_SEND_ENABLE
+    /* 3. 自动发送（调试用，从机模式默认关闭） */
+    AutoSend_Process();
+#endif
+
+    /* 4. 检查复位延时是否完成，完成则执行软件复位 */
+    if (m_bResetPending && nbDelay_IsComplete(&m_stcResetDelay))
+    {
+        MAIN_D("[MODBUS] Reset delay done, system reset now!");
+        m_bResetPending = false;
+        __NVIC_SystemReset();
+    }
+
+    /* 5. 每5秒打印配置参数（由 APP_MODBUS_PARAM_PRINT 宏控制） */
+    Modbus_PrintParams();
+}

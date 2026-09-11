@@ -1,0 +1,14 @@
+程序崩溃: 'MotorSimulatorGUI' object has no attribute 'log_lines'
+
+Traceback (most recent call last):
+  File "D:\HB_chuchai_v.2.0.0\project\motor_arbitration_sim.py", line 926, in <module>
+    app = MotorSimulatorGUI()
+  File "D:\HB_chuchai_v.2.0.0\project\motor_arbitration_sim.py", line 593, in __init__
+    self.sys = MotorArbitrationSystem(log_callback=self.gui_log)
+  File "D:\HB_chuchai_v.2.0.0\project\motor_arbitration_sim.py", line 211, in __init__
+    self._init_default_blocks()
+  File "D:\HB_chuchai_v.2.0.0\project\motor_arbitration_sim.py", line 215, in _init_default_blocks
+    self.log("[INIT] 初始化: IO_FWD -> block_fwd, IO_REV -> block_rev")
+  File "D:\HB_chuchai_v.2.0.0\project\motor_arbitration_sim.py", line 603, in gui_log
+    self.log_lines.append(msg)
+AttributeError: 'MotorSimulatorGUI' object has no attribute 'log_lines'
