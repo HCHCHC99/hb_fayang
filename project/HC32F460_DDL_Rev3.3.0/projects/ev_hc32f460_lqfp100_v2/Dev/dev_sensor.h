@@ -9,21 +9,21 @@
 #include "Adapter.h"
 #include "rtt_manager.h"
 
-// ========== µçÑ¹·ÖÑ¹Ä£Ê½Ñ¡Ôñ ==========
-// 0: ÎÞ·ÖÑ¹ - ´«¸ÐÆ÷Êä³öÖ±½Ó½ÓÈë MCU 0~3.3V ¶ÔÓ¦0~2A Á¿³Ì
-// 1: ÓÐ·ÖÑ¹ - Íâ²¿·ÖÑ¹µçÂ·½ÓÈë
-#define SENSOR_VOLTAGE_DIVIDER_ENABLE    0   // 1=ÓÐ·ÖÑ¹, 0=ÎÞ·ÖÑ¹
+// ========== ï¿½ï¿½Ñ¹ï¿½ï¿½Ñ¹Ä£Ê½Ñ¡ï¿½ï¿½ ==========
+// 0: ï¿½Þ·ï¿½Ñ¹ - ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ö±ï¿½Ó½ï¿½ï¿½ï¿½ MCU 0~3.3V ï¿½ï¿½Ó¦0~2A ï¿½ï¿½ï¿½ï¿½
+// 1: ï¿½Ð·ï¿½Ñ¹ - ï¿½â²¿ï¿½ï¿½Ñ¹ï¿½ï¿½Â·ï¿½ï¿½ï¿½ï¿½
+#define SENSOR_VOLTAGE_DIVIDER_ENABLE    0   // 1=ï¿½Ð·ï¿½Ñ¹, 0=ï¿½Þ·ï¿½Ñ¹
 
 
-// ========== Ð£×¼ÅäÖÃ ==========
-#define SENSOR_CALIB_DELAY_MS       (120U)   // ÉÏµçºóµÈ´ýÊ±¼ä£¬±Ü¿ª¼â·åµçÁ÷ (ms)
-#define SENSOR_CALIB_STABLE_MS      (50U)    // ADC ÎÈ¶¨µÈ´ýÊ±¼ä (ms)
+// ========== Ð£×¼ï¿½ï¿½ï¿½ï¿½ ==========
+#define SENSOR_CALIB_DELAY_MS       (120U)   // ï¿½Ïµï¿½ï¿½È´ï¿½Ê±ï¿½ä£¬ï¿½Ü¿ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ms)
+#define SENSOR_CALIB_STABLE_MS      (50U)    // ADC ï¿½È¶ï¿½ï¿½È´ï¿½Ê±ï¿½ï¿½ (ms)
 
 
-// ========== µçÑ¹·ÖÑ¹²ÎÊý£¨ÓÐ·ÖÑ¹Ä£Ê½Ê±ÉúÐ§£© ==========
+// ========== ï¿½ï¿½Ñ¹ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ð·ï¿½Ñ¹Ä£Ê½Ê±ï¿½ï¿½Ð§ï¿½ï¿½ ==========
 #if SENSOR_VOLTAGE_DIVIDER_ENABLE
-    #define SENSOR_DIVIDER_R1            (10000)   // ÉÏ·ÖÑ¹µç×è R1 (Å·Ä·)
-    #define SENSOR_DIVIDER_R2            (20000)   // ÏÂ·ÖÑ¹µç×è R2 (Å·Ä·)
+    #define SENSOR_DIVIDER_R1            (10000)   // ï¿½Ï·ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ R1 (Å·Ä·)
+    #define SENSOR_DIVIDER_R2            (20000)   // ï¿½Â·ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ R2 (Å·Ä·)
 
 
 #endif
@@ -35,14 +35,14 @@
 #endif
 
 
-// ========== Ó²¼þ°å±¾£º´«¸ÐÆ÷ÀàÐÍÑ¡Ôñ ==========
-// ÔÚ main.h ÖÐÍ¨¹ý BOARD_VERSION Í³Ò»¹ÜÀí
+// ========== Ó²ï¿½ï¿½ï¿½å±¾ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ñ¡ï¿½ï¿½ ==========
+// ï¿½ï¿½ main.h ï¿½ï¿½Í¨ï¿½ï¿½ BOARD_VERSION Í³Ò»ï¿½ï¿½ï¿½ï¿½
 #include "main.h"
 #if BOARD_VERSION == 0
-    // Ô­HB_chuchai°å£º»ô¶ûµçÁ÷´«¸ÐÆ÷ (Áãµã1650mV, ÁéÃô¶È66mV/A, Á¿³Ì¡À25A)
+    // Ô­HB_chuchaiï¿½å£ºï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ (ï¿½ï¿½ï¿½1650mV, ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½66mV/A, ï¿½ï¿½ï¿½Ì¡ï¿½25A)
     #define SENSOR_TYPE_DIFF_AMP_ENABLE    0
 #else
-    // ÕûºÏ°å£º²î·ÖÔË·Å (Vout = I * 0.1, 0mVÎª0A, 100mV/A)
+    // ï¿½ï¿½ï¿½Ï°å£ºï¿½ï¿½ï¿½ï¿½Ë·ï¿½ (Vout = I * 0.1, 0mVÎª0A, 100mV/A)
     #define SENSOR_TYPE_DIFF_AMP_ENABLE    1
 #endif
 
@@ -54,7 +54,7 @@
 #endif
 
 
-// ========== µ÷ÊÔºê¶¨Òå ==========
+// ========== ï¿½ï¿½ï¿½Ôºê¶¨ï¿½ï¿½ ==========
 #ifdef DEV_SENSOR
     #define SENSOR_DEBUG(fmt, ...)    MAIN_D("[SENSOR] " fmt, ##__VA_ARGS__)
 #else
@@ -73,14 +73,14 @@
     #define SENSOR_DEBUG_SLOW(fmt, ...)    ((void)0)
 #endif
 
-// ========== Ä£ÄâÄ£Ê½ºê¶¨Òå ==========
+// ========== Ä£ï¿½ï¿½Ä£Ê½ï¿½ê¶¨ï¿½ï¿½ ==========
 // #define SENSOR_SIMULATION_MODE
 
-// ========== ¹ýÁ÷¼ì²âÄ£Ê½ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£Ê½ ==========
 #define OVERCURRENT_MODE_SAMPLE_COUNT    0
 #define OVERCURRENT_MODE_TIME_WINDOW     1
 
-// ========== ¹ýÁ÷¸æ¾¯Çå³ýÄ£Ê½Ñ¡Ôñ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½æ¾¯ï¿½ï¿½ï¿½Ä£Ê½Ñ¡ï¿½ï¿½ ==========
 #define OVERCURRENT_CLEAR_AUTO      0
 #define OVERCURRENT_CLEAR_MANUAL    1
 
@@ -88,18 +88,18 @@
 #define OVERCURRENT_CLEAR_MODE      OVERCURRENT_CLEAR_MANUAL   
 #endif
 
-// ========== DEBUG ´°¿Ú»º³åÇø ==========
+// ========== DEBUG ï¿½ï¿½ï¿½Ú»ï¿½ï¿½ï¿½ï¿½ï¿½ ==========
 #define DEBUG_SENSOR_WINDOW_BUFFER
 #define SENSOR_WINDOW_BUFFER_SIZE     (200)
 
-// ========== ´«¸ÐÆ÷Ó²¼þ²ÎÊý£¨¸ù¾Ý°åÐÍ×Ô¶¯Ñ¡Ôñ£© ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ó²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ý°ï¿½ï¿½ï¿½ï¿½Ô¶ï¿½Ñ¡ï¿½ï¿½ ==========
 #if SENSOR_TYPE_DIFF_AMP_ENABLE
-    // ===== ²î·ÖÔË·ÅÄ£Ê½²ÎÊý (3.3V¹©µç, ¡À2.5AÁ¿³Ì) =====
-    // Áãµã=1650mV(Vcc/2), ÁéÃô¶È=264mV/A
+    // ===== ï¿½ï¿½ï¿½ï¿½Ë·ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½ (3.3Vï¿½ï¿½ï¿½ï¿½, ï¿½ï¿½2.5Aï¿½ï¿½ï¿½ï¿½) =====
+    // ï¿½ï¿½ï¿½=1650mV(Vcc/2), ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½=264mV/A
     #define SENSOR_RAW_ZERO_MV             (0)
     #define SENSOR_RAW_SENSITIVITY_MV_PER_A (100)
 #else
-    // ===== »ô¶ûµçÁ÷´«¸ÐÆ÷Ä£Ê½²ÎÊý (Ô­HB_chuchai) =====
+    // ===== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£Ê½ï¿½ï¿½ï¿½ï¿½ (Ô­HB_chuchai) =====
     #define SENSOR_RAW_ZERO_MV             (1650)
     #define SENSOR_RAW_SENSITIVITY_MV_PER_A (264)
 #endif
@@ -116,21 +116,27 @@
     #define SENSOR_SENSITIVITY_MV_PER_A ((float)SENSOR_SENSITIVITY_INT)
 #endif
 
-// ========== ´«¸ÐÆ÷Éè±¸ÃüÁî¶¨Òå ==========
+// ========== 100ms average current (for Modbus 0x2733 realtime display) ==========
+// Independent of overcurrent detection: overcurrent still uses instant
+// s32CurrentMa, so fault response speed is not affected
+#define SENSOR_AVG_WINDOW_MS         (100U)   // average window duration (ms)
+
+// ========== ä¼ æ„Ÿå™¨è®¾å¤‡å‘½ä»¤å®šä¹‰ ==========
 #define CMD_SENSOR_GET_CURRENT_MA      (CMD_BASE_ADC + 0x20)
 #define CMD_SENSOR_GET_CURRENT_AX100   (CMD_BASE_ADC + 0x21)
 #define CMD_SENSOR_SET_SIM_VALUE       (CMD_BASE_ADC + 0x22)
 #define CMD_SENSOR_GET_ALARM_STATUS    (CMD_BASE_ADC + 0x23)
 #define CMD_SENSOR_GET_CALIBRATION     (CMD_BASE_ADC + 0x24)
+#define CMD_SENSOR_GET_CURRENT_MA_AVG  (CMD_BASE_ADC + 0x25)   /* 100ms window average current (mA) */
 
-// ========== Ð£×¼²ÎÊý½á¹¹Ìå ==========
+// ========== Ð£×¼ï¿½ï¿½ï¿½ï¿½ï¿½á¹¹ï¿½ï¿½ ==========
 typedef struct {
     int32_t s32ZeroOffsetMv;
     int16_t s16SensitivityScale;
     int32_t s32CalibrationValid;
 } Sensor_Calibration_t;
 
-// ========== ´«¸ÐÆ÷Éè±¸ÅäÖÃ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½è±¸ï¿½ï¿½ï¿½ï¿½ ==========
 typedef struct {
     uint8_t     u8AdcDevId;
     int32_t     s32OvercurrentThresholdMa;
@@ -142,7 +148,7 @@ typedef struct {
     uint32_t    u32ReleaseWindowMs;
 } Sensor_Config_t;
 
-// ========== ¸æ¾¯×´Ì¬½á¹¹ ==========
+// ========== ï¿½æ¾¯×´Ì¬ï¿½á¹¹ ==========
 typedef struct {
     uint8_t  u8OvercurrentAlarm;
     uint16_t u16ConsecutiveCount;
@@ -151,14 +157,14 @@ typedef struct {
     uint8_t  u8TimerRunning;
 } Sensor_AlarmState_t;
 
-// ========== ¹ýÁ÷¸æ¾¯ÊÂ¼þ½á¹¹Ìå ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½æ¾¯ï¿½Â¼ï¿½ï¿½á¹¹ï¿½ï¿½ ==========
 typedef struct {
     int32_t  s32CurrentMa;
     int32_t  s32ThresholdMa;
     uint8_t  u8IsActive;
 } Current_AlarmEvent_t;
 
-// ========== ´«¸ÐÆ÷Éè±¸½á¹¹Ìå ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½è±¸ï¿½á¹¹ï¿½ï¿½ ==========
 typedef struct {
     Sensor_Config_t     stcConfig;
     uint8_t             u8Initialized;
@@ -172,14 +178,20 @@ typedef struct {
     uint8_t             u8Calibrated;
     uint32_t            u32InitTime;
 
+    /* 100ms average current state (updated in Sensor_Device_Update) */
+    int32_t             s32AvgCurrentMa;    /* last completed window average (mA) */
+    int32_t             s32AvgAccumMa;      /* in-window sample sum (mA) */
+    uint32_t            u32AvgSampleCnt;    /* in-window sample count */
+    uint32_t            u32AvgWindowStart;  /* window start tick (ms) */
+
     struct {
-        uint8_t  u8CalibDelayDone;   // 120ms ÑÓÊ±ÊÇ·ñÒÑÍê³É
-        uint32_t u32CalibStartTime;  // 50ms Ð£×¼¿ªÊ¼Ê±¼ä
+        uint8_t  u8CalibDelayDone;   // 120ms ï¿½ï¿½Ê±ï¿½Ç·ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½
+        uint32_t u32CalibStartTime;  // 50ms Ð£×¼ï¿½ï¿½Ê¼Ê±ï¿½ï¿½
     } stcCalibState;
         
 } Sensor_Device_t;
 
-// ========== ¶ÁÏìÓ¦½á¹¹Ìå ==========
+// ========== ï¿½ï¿½ï¿½ï¿½Ó¦ï¿½á¹¹ï¿½ï¿½ ==========
 typedef struct {
     int32_t  s32CurrentMa;
     int16_t  s16CurrentAx100;
@@ -187,7 +199,7 @@ typedef struct {
     uint16_t u16AdcVoltageMv;
 } Sensor_ReadResponse_t;
 
-// ========== ±ê×¼Éè±¸½Ó¿Ú ==========
+// ========== ï¿½ï¿½×¼ï¿½è±¸ï¿½Ó¿ï¿½ ==========
 DeviceResult_t Sensor_Device_Init(void* handle);
 DeviceResult_t Sensor_Device_Deinit(void* handle);
 DeviceResult_t Sensor_Device_Read(void* handle, void* data, uint32_t size);
@@ -195,27 +207,27 @@ DeviceResult_t Sensor_Device_Write(void* handle, const void* data, uint32_t size
 DeviceResult_t Sensor_Device_Control(void* handle, DeviceCommandData_t* cmd);
 DeviceResult_t Sensor_Device_Update(void* handle);
 
-// ========== ´«¸ÐÆ÷È¡Öµ½Ó¿Ú ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½È¡Öµï¿½Ó¿ï¿½ ==========
 int32_t Sensor_Device_GetCurrentMA(Sensor_Device_t* pstcDev);
 int16_t Sensor_Device_GetCurrentAx100(Sensor_Device_t* pstcDev);
 Sensor_Device_t* Sensor_Device_Create(const Sensor_Config_t* pstcConfig);
 
-// ========== Ð£×¼½Ó¿Ú ==========
+// ========== Ð£×¼ï¿½Ó¿ï¿½ ==========
 void Sensor_Device_CalibrateZero(Sensor_Device_t* pstcDev);
 void Sensor_Device_SetSensitivityScale(Sensor_Device_t* pstcDev, int16_t s16ScalePercent);
 void Sensor_Device_GetCalibration(Sensor_Device_t* pstcDev, Sensor_Calibration_t* pstcCal);
 
-// ========== Ä£ÄâÄ£Ê½½Ó¿Ú ==========
+// ========== Ä£ï¿½ï¿½Ä£Ê½ï¿½Ó¿ï¿½ ==========
 #ifdef SENSOR_SIMULATION_MODE
-void Sensor_SetSimulationValue(uint16_t u16VoltageMv);      // ÉèÖÃÄ£ÄâµÄÔ­Ê¼µçÑ¹(mV)
-void Sensor_SetSimulationCurrent(int32_t s32CurrentMa);     // Ö±½ÓÉèÖÃÄ£ÄâµçÁ÷Öµ(mA)
-uint16_t Sensor_GetSimulationSensorRawMv(void);             // ¶ÁÈ¡µ±Ç°Ä£Äâ´«¸ÐÆ÷µÄÔ­Ê¼Öµ
+void Sensor_SetSimulationValue(uint16_t u16VoltageMv);      // ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½Ô­Ê¼ï¿½ï¿½Ñ¹(mV)
+void Sensor_SetSimulationCurrent(int32_t s32CurrentMa);     // Ö±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½ï¿½ï¿½ï¿½Öµ(mA)
+uint16_t Sensor_GetSimulationSensorRawMv(void);             // ï¿½ï¿½È¡ï¿½ï¿½Ç°Ä£ï¿½â´«ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô­Ê¼Öµ
 #endif
 
-// ========== ¹ýÁ÷¸æ¾¯ÊÖ¶¯Çå³ý½Ó¿Ú ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½æ¾¯ï¿½Ö¶ï¿½ï¿½ï¿½ï¿½ï¿½Ó¿ï¿½ ==========
 void Sensor_Device_ClearAlarm(Sensor_Device_t* pstcDev);
 
-// ========== È«¾Ö²Ù×÷º¯Êý±í ==========
+// ========== È«ï¿½Ö²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ==========
 extern const DeviceOps_t g_sensor_ops;
 
 #endif /* DEV_SENSOR_H_ */

@@ -3,15 +3,15 @@
 #include "rtt_log.h"
 #include <string.h>
 #include <stdlib.h>
-// dev_sensor¾­¹ýÐ£×¼ºÍÁéÃô¶ÈÐÞÕýºóµÄ×îÖÕµçÁ÷Öµ(mA)
+// dev_sensorï¿½ï¿½ï¿½ï¿½Ð£×¼ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Õµï¿½ï¿½ï¿½Öµ(mA)
 volatile int32_t g_dbg_sensor_final_ma = 0;
-// ========== Ä£ÄâÄ£Ê½È«¾Ö±äÁ¿ ==========
+// ========== Ä£ï¿½ï¿½Ä£Ê½È«ï¿½Ö±ï¿½ï¿½ï¿½ ==========
 #ifdef SENSOR_SIMULATION_MODE
-    // Ä£ÄâµÄÊÇ´«¸ÐÆ÷Ô­Ê¼Êä³öµçÑ¹£¨mV£©£¬²»ÊÇADCÊäÈëµçÑ¹
+    // Ä£ï¿½ï¿½ï¿½ï¿½Ç´ï¿½ï¿½ï¿½ï¿½ï¿½Ô­Ê¼ï¿½ï¿½ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½mVï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ADCï¿½ï¿½ï¿½ï¿½ï¿½Ñ¹
     static volatile uint16_t s_u16SimSensorRawMv = 1650;
     volatile uint16_t* const g_pu16DbgSimSensorRawMv = &s_u16SimSensorRawMv;
     
-    // ¸ù¾Ý´«¸ÐÆ÷Ô­Ê¼µçÑ¹¼ÆËãADCÊäÈëµçÑ¹£¨¿¼ÂÇ·ÖÑ¹µçÂ·£©
+    // ï¿½ï¿½ï¿½Ý´ï¿½ï¿½ï¿½ï¿½ï¿½Ô­Ê¼ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ADCï¿½ï¿½ï¿½ï¿½ï¿½Ñ¹ï¿½ï¿½ï¿½ï¿½ï¿½Ç·ï¿½Ñ¹ï¿½ï¿½Â·ï¿½ï¿½
     static uint16_t Sensor_Sim_GetAdcVoltageMv(uint16_t u16SensorRawMv) {
 #if SENSOR_VOLTAGE_DIVIDER_ENABLE
         // V_adc = V_sensor * R2 / (R1 + R2)
@@ -21,9 +21,9 @@ volatile int32_t g_dbg_sensor_final_ma = 0;
 #endif
     }
     
-    // ¸ù¾ÝÆÚÍûµçÁ÷ÖµÉèÖÃÄ£ÄâÖµ£¨¸üÖ±¹ÛµÄ½Ó¿Ú£©
+    // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Öµï¿½ï¿½ï¿½ï¿½Ä£ï¿½ï¿½Öµï¿½ï¿½ï¿½ï¿½Ö±ï¿½ÛµÄ½Ó¿Ú£ï¿½
     static void Sensor_Sim_SetCurrent(int32_t s32CurrentMa) {
-        // ·´Ïò¼ÆËã£ºCurrent -> ´«¸ÐÆ÷Ô­Ê¼µçÑ¹
+        // ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ã£ºCurrent -> ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ô­Ê¼ï¿½ï¿½Ñ¹
         // V_sensor = ZeroPoint + Current * Sensitivity
         int32_t s32SensorRawMv = SENSOR_RAW_ZERO_MV + 
                                   (s32CurrentMa * SENSOR_RAW_SENSITIVITY_MV_PER_A) / 1000;
@@ -37,13 +37,13 @@ volatile int32_t g_dbg_sensor_final_ma = 0;
     #define SIM_ADC_RAW_VALUE(voltage)  ((uint16_t)((uint32_t)(voltage) * 4095 / 3300))
 #endif
 
-// ========== ÂýËÙ´òÓ¡ ==========
+// ========== ï¿½ï¿½ï¿½Ù´ï¿½Ó¡ ==========
 #ifdef DEBUG_SENSOR_SLOW
     static uint32_t s_u32LastSlowPrintTime = 0;
     #define SLOW_PRINT_INTERVAL_MS   4000
 #endif
 
-// ========== ÕæÊµÄ£Ê½µ÷ÊÔ ==========
+// ========== ï¿½ï¿½ÊµÄ£Ê½ï¿½ï¿½ï¿½ï¿½ ==========
 #ifdef DEV_SENSOR_REAL
     static NonBlockingDelay_t s_stcRealDbgTimer;
     static uint8_t s_u8RealDbgTimerInit = 0;
@@ -64,7 +64,7 @@ volatile int32_t g_dbg_sensor_final_ma = 0;
     }
 #endif
 
-// ========== ´°¿Úµ÷ÊÔ»º³åÇø ==========
+// ========== ï¿½ï¿½ï¿½Úµï¿½ï¿½Ô»ï¿½ï¿½ï¿½ï¿½ï¿½ ==========
 #ifdef DEBUG_SENSOR_WINDOW_BUFFER
     volatile uint16_t g_u16DbgSensorBuffer[SENSOR_WINDOW_BUFFER_SIZE] = {0};
     volatile uint16_t g_u16DbgSensorBufIndex = 0;
@@ -97,7 +97,7 @@ volatile int32_t g_dbg_sensor_final_ma = 0;
     }
 #endif
 
-// ========== Ð£×¼¾²Ì¬º¯Êý ==========
+// ========== Ð£×¼ï¿½ï¿½Ì¬ï¿½ï¿½ï¿½ï¿½ ==========
 static void Sensor_CalibrateZeroInternal(Sensor_Device_t* pstcDev, uint16_t u16AdcVoltageMv) {
     if (!pstcDev) return;
     
@@ -112,7 +112,7 @@ static void Sensor_CalibrateZeroInternal(Sensor_Device_t* pstcDev, uint16_t u16A
                  (int)s32ZeroTheory, (int)s32ZeroMeas, (int)s32ZeroOffset);
 }
 
-// ========== µçÁ÷¼ÆËã¾²Ì¬º¯Êý ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ã¾²Ì¬ï¿½ï¿½ï¿½ï¿½ ==========
 static int32_t Sensor_CalcCurrentInternal(Sensor_Device_t* pstcDev, uint16_t u16AdcVoltageMv) {
     if (!pstcDev) return 0;
     
@@ -149,7 +149,7 @@ static int32_t Sensor_CalcCurrentInternal(Sensor_Device_t* pstcDev, uint16_t u16
     return s32CurrentMa;
 }
 
-// ========== ´ÓADC¶ÁÈ¡Êý¾Ý ==========
+// ========== ï¿½ï¿½ADCï¿½ï¿½È¡ï¿½ï¿½ï¿½ï¿½ ==========
 static DeviceResult_t Sensor_ReadFromAdc(Sensor_Device_t* pstcDev) {
     if (!pstcDev) return RESULT_PARAM_ERR;
     
@@ -179,7 +179,7 @@ static DeviceResult_t Sensor_ReadFromAdc(Sensor_Device_t* pstcDev) {
 #endif
 }
 
-// ========== ¼ÆËãµçÁ÷ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ==========
 static void Sensor_CalcCurrent(Sensor_Device_t* pstcDev) {
     if (!pstcDev) return;
     
@@ -187,12 +187,12 @@ static void Sensor_CalcCurrent(Sensor_Device_t* pstcDev) {
     pstcDev->s16CurrentAx100 = (int16_t)(pstcDev->s32CurrentMa / 10);
     
     // ============================================================
-    // ¡ï¡ï¡ï JScopeµ÷ÊÔ±äÁ¿¸üÐÂ - È¡¾ø¶ÔÖµ ¡ï¡ï¡ï
+    // ï¿½ï¿½ï¿½ï¿½ JScopeï¿½ï¿½ï¿½Ô±ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ - È¡ï¿½ï¿½ï¿½ï¿½Öµ ï¿½ï¿½ï¿½ï¿½
     // ============================================================
     g_dbg_sensor_final_ma = (pstcDev->s32CurrentMa >= 0) ? pstcDev->s32CurrentMa : -pstcDev->s32CurrentMa;
 }
 
-// ========== ¹ýÁ÷¼ì²â - µãÊýÄ£Ê½ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ - ï¿½ï¿½ï¿½ï¿½Ä£Ê½ ==========
 static void Sensor_CheckOvercurrent_SampleCount(Sensor_Device_t* pstcDev, 
                                                    uint8_t u8IsOvercurrent, 
                                                    uint8_t u8IsNormal,
@@ -244,7 +244,7 @@ static void Sensor_CheckOvercurrent_SampleCount(Sensor_Device_t* pstcDev,
     }
 }
 
-// ========== ¹ýÁ÷¼ì²â - Ê±¼äÄ£Ê½ ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ - Ê±ï¿½ï¿½Ä£Ê½ ==========
 static void Sensor_CheckOvercurrent_TimeWindow(Sensor_Device_t* pstcDev, 
                                                  uint8_t u8IsOvercurrent, 
                                                  uint8_t u8IsNormal,
@@ -332,7 +332,7 @@ static void Sensor_CheckOvercurrent_TimeWindow(Sensor_Device_t* pstcDev,
     }
 }
 
-// ========== ¹ýÁ÷¼ì²âÍ³Ò»Èë¿Ú ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Í³Ò»ï¿½ï¿½ï¿½ ==========
 static void Sensor_CheckOvercurrent(Sensor_Device_t* pstcDev) {
     if (!pstcDev) return;
 
@@ -369,7 +369,7 @@ static void Sensor_CheckOvercurrent(Sensor_Device_t* pstcDev) {
     }
 }
 
-// ========== ±ê×¼Éè±¸²Ù×÷ ==========
+// ========== ï¿½ï¿½×¼ï¿½è±¸ï¿½ï¿½ï¿½ï¿½ ==========
 DeviceResult_t Sensor_Device_Init(void* handle) {
     Sensor_Device_t* pstcDev = (Sensor_Device_t*)handle;
     if (!pstcDev) return RESULT_PARAM_ERR;
@@ -394,7 +394,13 @@ DeviceResult_t Sensor_Device_Init(void* handle) {
     pstcDev->u16AdcVoltageMv = 0;
     pstcDev->s32CurrentMa = 0;
     pstcDev->s16CurrentAx100 = 0;
-    
+
+    /* 100ms average current state init */
+    pstcDev->s32AvgCurrentMa = 0;
+    pstcDev->s32AvgAccumMa = 0;
+    pstcDev->u32AvgSampleCnt = 0;
+    pstcDev->u32AvgWindowStart = tickTimer_GetCount();
+
     pstcDev->stcAlarmState.u8OvercurrentAlarm = 0;
     pstcDev->stcAlarmState.u16ConsecutiveCount = 0;
     pstcDev->stcAlarmState.u8TimerRunning = 0;
@@ -469,9 +475,25 @@ DeviceResult_t Sensor_Device_Update(void* handle) {
     if (res != RESULT_OK) {
         return res;
     }
-    
+
     Sensor_CalcCurrent(pstcDev);
-    
+
+    /* 100ms average current accumulation (signed sum, for Modbus 0x2733) */
+    pstcDev->s32AvgAccumMa += pstcDev->s32CurrentMa;
+    pstcDev->u32AvgSampleCnt++;
+    {
+        uint32_t u32AvgElapsed = tickTimer_GetCount() - pstcDev->u32AvgWindowStart;
+        if (u32AvgElapsed >= SENSOR_AVG_WINDOW_MS) {
+            if (pstcDev->u32AvgSampleCnt > 0) {
+                pstcDev->s32AvgCurrentMa =
+                    pstcDev->s32AvgAccumMa / (int32_t)pstcDev->u32AvgSampleCnt;
+            }
+            pstcDev->s32AvgAccumMa = 0;
+            pstcDev->u32AvgSampleCnt = 0;
+            pstcDev->u32AvgWindowStart = tickTimer_GetCount();
+        }
+    }
+
     static uint32_t s_u32LastEmaPrint = 0;
     uint32_t u32Now = tickTimer_GetCount();
     if (u32Now - s_u32LastEmaPrint >= 100) {
@@ -555,6 +577,12 @@ DeviceResult_t Sensor_Device_Control(void* handle, DeviceCommandData_t* pstcCmd)
                 return RESULT_OK;
             }
             return RESULT_PARAM_ERR;
+        case CMD_SENSOR_GET_CURRENT_MA_AVG:
+            if (pstcCmd->response && pstcCmd->response_size >= sizeof(int32_t)) {
+                *(int32_t*)pstcCmd->response = pstcDev->s32AvgCurrentMa;
+                return RESULT_OK;
+            }
+            return RESULT_PARAM_ERR;
         case CMD_SENSOR_GET_CURRENT_AX100:
             if (pstcCmd->response && pstcCmd->response_size >= sizeof(int16_t)) {
                 *(int16_t*)pstcCmd->response = pstcDev->s16CurrentAx100;
@@ -578,7 +606,7 @@ DeviceResult_t Sensor_Device_Control(void* handle, DeviceCommandData_t* pstcCmd)
     }
 }
 
-// ========== µçÁ÷´«¸ÐÆ÷ÌØ¶¨½Ó¿Ú ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½Ø¶ï¿½ï¿½Ó¿ï¿½ ==========
 int32_t Sensor_Device_GetCurrentMA(Sensor_Device_t* pstcDev) {
     if (!pstcDev || !pstcDev->u8Initialized) return 0;
     return pstcDev->s32CurrentMa;
@@ -602,7 +630,7 @@ Sensor_Device_t* Sensor_Device_Create(const Sensor_Config_t* pstcConfig) {
     return pstcDev;
 }
 
-// ========== Ð£×¼½Ó¿ÚÊµÏÖ ==========
+// ========== Ð£×¼ï¿½Ó¿ï¿½Êµï¿½ï¿½ ==========
 void Sensor_Device_CalibrateZero(Sensor_Device_t* pstcDev) {
     if (!pstcDev || !pstcDev->u8Initialized) return;
     
@@ -630,7 +658,7 @@ void Sensor_Device_GetCalibration(Sensor_Device_t* pstcDev, Sensor_Calibration_t
     *pstcCal = pstcDev->stcCalibration;
 }
 
-// ========== Ä£ÄâÄ£Ê½½Ó¿Ú ==========
+// ========== Ä£ï¿½ï¿½Ä£Ê½ï¿½Ó¿ï¿½ ==========
 #ifdef SENSOR_SIMULATION_MODE
 void Sensor_SetSimulationValue(uint16_t u16VoltageMv) {
     s_u16SimSensorRawMv = u16VoltageMv;
@@ -645,7 +673,7 @@ uint16_t Sensor_GetSimulationSensorRawMv(void) {
 }
 #endif
 
-// ========== ¹ýÁ÷¸æ¾¯ÊÖ¶¯Çå³ý½Ó¿Ú ==========
+// ========== ï¿½ï¿½ï¿½ï¿½ï¿½æ¾¯ï¿½Ö¶ï¿½ï¿½ï¿½ï¿½ï¿½Ó¿ï¿½ ==========
 void Sensor_Device_ClearAlarm(Sensor_Device_t* pstcDev) {
     if (!pstcDev || !pstcDev->u8Initialized) return;
     if (!pstcDev->stcAlarmState.u8OvercurrentAlarm) return;
@@ -663,7 +691,7 @@ void Sensor_Device_ClearAlarm(Sensor_Device_t* pstcDev) {
     EventBus_Publish(TOPIC_CURRENT_ALARM, &stcEvent);
 }
 
-// ========== È«¾Ö²Ù×÷º¯Êý±í ==========
+// ========== È«ï¿½Ö²ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ï¿½ ==========
 const DeviceOps_t g_sensor_ops = {
     .init = Sensor_Device_Init,
     .deinit = Sensor_Device_Deinit,
