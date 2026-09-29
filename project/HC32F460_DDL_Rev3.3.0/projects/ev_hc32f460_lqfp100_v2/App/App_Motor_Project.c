@@ -296,18 +296,16 @@ static void RegisterAllDevices(void) {
         if (u32UndervoltageHysteresisMv == 0) {
             u32UndervoltageHysteresisMv = PARAM_DEFAULT_VOLTAGE_LOWER_HYSTERESIS * 100UL;
         }
-        /* 电压确认窗固定为29ms: 1ms节拍 x 连续30次越限(首末样本跨度>=29ms)
-         * 触发延迟理想 29~30ms; Flash 中可能存有旧默认值 0~11，统一拉到当前默认值 30 */
+        /* 过压确认窗固定为29ms: 1ms节拍 x 连续30次越限(首末样本跨度>=29ms)
+         * Flash 中可能存有旧默认值 0~30，向上拉到当前默认值 30 */
         if (u8OvervoltageTriggerCount < PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT) {
             u8OvervoltageTriggerCount = PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT;
         }
-        if (u8UndervoltageTriggerCount < PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT) {
-            u8UndervoltageTriggerCount = PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
-        }
-
-        /* [临时改动] 关闭欠压检测: 阈值强制0mV, u32BusMv<=0 永不成立(母线电压含补偿至少400mV)
-         * 恢复: 删除下面一行, 欠压阈值恢复为 Flash/默认值 (21.0V) */
-        u32UndervoltageThresholdMv = 0UL;
+        /* [欠压判定窗 11~12ms] 1ms节拍 x 连续12次越限(首末样本跨度=11ms)
+         * 触发延迟理想 11~12ms; 欠压计数直接采用默认值、不读Flash:
+         * Flash 可能存有旧值(1/3/5/6/11/30), 下限保护只能向上拉,
+         * 无法把旧值30降回12, 故欠压改为强制赋值 */
+        u8UndervoltageTriggerCount = PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
 
         MAIN_D("[APP] Voltage config from Flash: upper=%lu mV (0.1V=%d), lower=%lu mV (0.1V=%d), "
             "upper_hys=%lu mV, lower_hys=%lu mV, ov_cnt=%d, uv_cnt=%d",
@@ -676,17 +674,14 @@ void App_ReloadConfig(void)
             (uint32_t)g_AppParam.voltage_upper_hysteresis * 100UL;
         g_voltage_bus_dev->stcConfig.u32UndervoltageHysteresisMv =
             (uint32_t)g_AppParam.voltage_lower_hysteresis * 100UL;
-        /* 电压确认窗固定为29ms: Flash 旧值(0~11)统一拉到默认值 30 */
+        /* 过压确认窗固定为29ms: Flash 旧值向上拉到默认值 30 */
         g_voltage_bus_dev->stcConfig.u8OvervoltageTriggerCount =
             (g_AppParam.overvoltage_trigger_count < PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT)
                 ? PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT
                 : g_AppParam.overvoltage_trigger_count;
+        /* [欠压判定窗 11~12ms] 欠压计数强制默认值12, 不读Flash(旧值无法向下拉) */
         g_voltage_bus_dev->stcConfig.u8UndervoltageTriggerCount =
-            (g_AppParam.undervoltage_trigger_count < PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT)
-                ? PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT
-                : g_AppParam.undervoltage_trigger_count;
-        /* [临时改动] 欠压检测关闭: 阈值强制0mV (恢复: 删除下面一行) */
-        g_voltage_bus_dev->stcConfig.u32UndervoltageThresholdMv = 0UL;
+            PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT;
 
         MAIN_D("[RELOAD] Voltage: over=%lu mV, under=%lu mV\r\n",
                g_voltage_bus_dev->stcConfig.u32OvervoltageThresholdMv,

@@ -134,7 +134,7 @@
 #define PARAM_DEFAULT_VOLTAGE_UPPER_HYSTERESIS  (20U)       /* 过压迟滞 0.1V (2.0V) */
 #define PARAM_DEFAULT_VOLTAGE_LOWER_HYSTERESIS  (20U)       /* 欠压迟滞 0.1V (2.0V) */
 #define PARAM_DEFAULT_OVERVOLTAGE_TRIGGER_CNT   (30U)       /* 过压触发计数: 1ms节拍x连续30次越限, 首末样本跨度>=29ms确认窗 */
-#define PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT  (30U)       /* 欠压触发计数: 1ms节拍x连续30次越限, 首末样本跨度>=29ms确认窗 */
+#define PARAM_DEFAULT_UNDERVOLTAGE_TRIGGER_CNT  (12U)       /* 欠压触发计数: 1ms节拍x连续12次越限, 首末样本跨度=11ms, 触发延迟11~12ms */
 #define PARAM_DEFAULT_CURRENT_HYSTERESIS_MA     (0U)        /* 过流迟滞 1mA (0A) - 设为0表示无迟滞 */
 #define PARAM_DEFAULT_CURRENT_RELEASE_MS        (200U)      /* 过流释放时间窗口 1ms (0.2s) */
 #define PARAM_DEFAULT_OVERCURRENT_TRIGGER_CNT   (1U)        /* 过流触发计数 (时间窗口模式可选择使用) */
