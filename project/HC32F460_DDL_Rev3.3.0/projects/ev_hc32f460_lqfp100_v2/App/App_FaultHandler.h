@@ -21,6 +21,7 @@ typedef struct {
 #define FAULT_TYPE_OVERVOLTAGE      0
 #define FAULT_TYPE_UNDERVOLTAGE     1
 #define FAULT_TYPE_OVERCURRENT      2
+#define FAULT_TYPE_TIMEOUT          3
 
 /**
  * @brief  初始化故障处理器

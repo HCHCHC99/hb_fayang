@@ -241,6 +241,8 @@ static const MotorDeviceGene_t c_device_genes[] = {
     { DEV_ID_UNDERVOLTAGE_REV,  PRIO_LIMIT,     CAP_BLOCK },
     { DEV_ID_OVERCUR_FWD,       PRIO_LIMIT,     CAP_BLOCK },
     { DEV_ID_OVERCUR_REV,       PRIO_LIMIT,     CAP_BLOCK },
+    { DEV_ID_TIMEOUT_FWD,       PRIO_LIMIT,     CAP_BLOCK },
+    { DEV_ID_TIMEOUT_REV,       PRIO_LIMIT,     CAP_BLOCK },
     // { DEV_ID_CAN,        (MotorPriority_t)CAN_PRIORITY,   MOTOR_CAN_CAPABILITY },
     { DEV_ID_IO_FWD,     (MotorPriority_t)MANUAL_PRIORITY, MOTOR_MANUAL_CAPABILITY },
     { DEV_ID_IO_REV,     (MotorPriority_t)MANUAL_PRIORITY, MOTOR_MANUAL_CAPABILITY },
@@ -1805,6 +1807,55 @@ MotorDir_t Motor_GetDesiredDirection(MotorDevice_t* motor) {
         return motor->active_dir;
     }
     return DIR_NONE;
+}
+
+// ========== Motion timeout (FAULT_BIT_MOTION_TIMEOUT) handling ==========
+// Trip: emergency stop both directions (insert BLOCK into block_fwd/block_rev)
+// and clear allow_fwd/allow_rev so the motor will not self-restart after the
+// fault is cleared (mirrors Motor_OnRTurnLimit logic).
+void Motor_OnMotionTimeout(void) {
+    DeviceNode_t* node = DeviceManager_Get(DEV_MOTOR_ID);
+    if (!node || !node->private_data) return;
+
+    MotorDevice_t* motor = (MotorDevice_t*)node->private_data;
+
+    MotorControlCommand_t block_fwd_cmd = {
+        .device_id = DEV_ID_TIMEOUT_FWD,
+        .priority = PRIO_LIMIT,
+        .type = CMD_TYPE_BLOCK_FWD,
+        .timestamp = tickTimer_GetCount()
+    };
+    Motor_CmdList_SetBlock(&motor->block_fwd, block_fwd_cmd);
+
+    MotorControlCommand_t block_rev_cmd = {
+        .device_id = DEV_ID_TIMEOUT_REV,
+        .priority = PRIO_LIMIT,
+        .type = CMD_TYPE_BLOCK_REV,
+        .timestamp = tickTimer_GetCount()
+    };
+    Motor_CmdList_SetBlock(&motor->block_rev, block_rev_cmd);
+
+    // Must also clear the stale allow commands, otherwise once the BLOCK entries
+    // are removed (fault cleared) the pending run command would restart the motor.
+    Motor_ClearAllowFwd(motor);
+    Motor_ClearAllowRev(motor);
+
+    Motor_ArbitrationDecision(motor);
+
+    MAIN_D("Motor: MOTION TIMEOUT! Block both directions + clear allow\r\n");
+}
+
+// ========== Motion timeout manual clear interface ==========
+void Motor_ClearMotionTimeoutBlock(MotorDevice_t* motor) {
+    if (!motor) return;
+
+    MOTOR_DEBUG("ClearMotionTimeoutBlock: removing block_fwd/rev for DEV_ID_TIMEOUT\r\n");
+
+    Motor_CmdList_Remove(&motor->block_fwd, DEV_ID_TIMEOUT_FWD);
+    Motor_CmdList_Remove(&motor->block_rev, DEV_ID_TIMEOUT_REV);
+
+    // Re-arbitrate
+    Motor_ArbitrationDecision(motor);
 }
 
 // ========== 过流故障手动清除接口 ==========

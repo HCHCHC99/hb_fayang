@@ -11,6 +11,7 @@
 #include "dev_motor.h"
 #include "App_Motor_Project.h"
 #include "App_RunAngle.h"
+#include "App_MotionTimeout.h"
 #include <string.h>
 
 /*=============================================================================
@@ -200,6 +201,14 @@ int32_t Param_ReadByReg(uint16_t regAddr, uint16_t *pValue)
 
     case REG_CURRENT_DETECT_MS:
         *pValue = g_AppParam.current_detect_ms;
+        break;
+
+    case REG_TIMEOUT_T1:
+        *pValue = g_AppParam.timeout_t1_s;
+        break;
+
+    case REG_TIMEOUT_MARGIN:
+        *pValue = g_AppParam.timeout_margin_s;
         break;
 
         case REG_MOTOR_HALL_DIR:
@@ -402,6 +411,14 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
         g_AppParam.current_detect_ms = value;
         break;
 
+    case REG_TIMEOUT_T1:
+        g_AppParam.timeout_t1_s = value;
+        break;
+
+    case REG_TIMEOUT_MARGIN:
+        g_AppParam.timeout_margin_s = value;
+        break;
+
         case REG_MOTOR_HALL_DIR:
             g_AppParam.motor_hall_dir = value;
             break;
@@ -482,6 +499,9 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
             /* 急停后清除正转/反转状态 */
             s_u16CtrlCmdState &= (uint16_t)(~(CTRL_CMD_FWD | CTRL_CMD_REV));
 
+            /* 急停取消当前超时检测 */
+            MotionTimeout_Cancel();
+
             PARAMS_DBG("REG_CTRL_CMD: ESTOP (value=0x%04X)", (unsigned int)value);
             EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
             break;
@@ -502,6 +522,8 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
         {
             /* bit1=1: 上锁对 bit3~bit5 的控制权限 */
             s_bCtrlCmdUnlocked = false;
+            /* 上锁取消当前超时检测 */
+            MotionTimeout_Cancel();
             PARAMS_DBG("REG_CTRL_CMD: LOCK (value=0x%04X), bit3~bit5 now locked", (unsigned int)value);
             /* 脉冲式，上锁后不发布事件 */
             break;
@@ -539,6 +561,12 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
 
                 PARAMS_DBG("REG_CTRL_CMD: RUN FWD (value=0x%04X)", (unsigned int)value);
                 EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
+
+                /* 类型1: 正转(开窗)被受理后启动超时检测, T1=0 时关闭 */
+                if (g_AppParam.timeout_t1_s != 0U)
+                {
+                    MotionTimeout_Start((uint32_t)g_AppParam.timeout_t1_s * 1000U);
+                }
             }
             else
             {
@@ -561,6 +589,12 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
 
                 PARAMS_DBG("REG_CTRL_CMD: RUN REV (value=0x%04X)", (unsigned int)value);
                 EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
+
+                /* 类型1: 反转(关窗)被受理后启动超时检测, T1=0 时关闭 */
+                if (g_AppParam.timeout_t1_s != 0U)
+                {
+                    MotionTimeout_Start((uint32_t)g_AppParam.timeout_t1_s * 1000U);
+                }
             }
             else
             {
@@ -590,12 +624,17 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
         {
             FaultHandler_ClearFault(FAULT_TYPE_OVERCURRENT);
         }
+        if (value & FAULT_BIT_MOTION_TIMEOUT)
+        {
+            FaultHandler_ClearFault(FAULT_TYPE_TIMEOUT);
+        }
         /* 如果写入0x0000，清除所有故障 */
         if (value == 0U)
         {
             FaultHandler_ClearFault(FAULT_TYPE_OVERVOLTAGE);
             FaultHandler_ClearFault(FAULT_TYPE_UNDERVOLTAGE);
             FaultHandler_ClearFault(FAULT_TYPE_OVERCURRENT);
+            FaultHandler_ClearFault(FAULT_TYPE_TIMEOUT);
         }
         break;
 

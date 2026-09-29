@@ -15,7 +15,7 @@
 #include "rtt_manager.h"
 
 // ========== ���Ժ궨�� ==========
-// ���е������ͳһʹ��? rtt_manager.h �еĺ꣬ͨ�� DEV_MOTOR ���ƿ���
+// ���е������ͳһʹ��? rtt_manager.h �еĺ꣬ͨ�� DEV_MOTOR ���ƿ���
 
 #ifdef DEV_MOTOR
     #define MOTOR_DEBUG(fmt, ...)    MAIN_D("[MOTOR_DEBUG] " fmt, ##__VA_ARGS__)
@@ -26,7 +26,7 @@
 #endif
 
 
-// ========== Ӳ���汾���������ģ�? ==========
+// ========== Ӳ���汾���������ģ�? ==========
 // �� main.h ��ͨ�� BOARD_VERSION ͳһ����
 #include "main.h"
 #if BOARD_VERSION == 0
@@ -37,7 +37,7 @@
     #define MOTOR_CONTROL_MODE  1
 #endif
 
-// ========== ����豸�����? ==========
+// ========== ����豸�����? ==========
 // ע�⣺CMD_BASE_MOTOR �� device_manager.h ��û��Ԥ���壬�ڴ˶���
 #define CMD_BASE_MOTOR              0x9000
 #define CMD_MOTOR_STOP              (CMD_BASE_MOTOR + 0x01)
@@ -46,10 +46,10 @@
 #define CMD_MOTOR_SET_SPEED         (CMD_BASE_MOTOR + 0x04)
 #define CMD_MOTOR_EMERGENCY_STOP    (CMD_BASE_MOTOR + 0x05)
 // ���ӵ� dev_motor.h �е��������չ
-#define CMD_MOTOR_GET_DESIRED_DIR   (CMD_BASE_MOTOR + 0x06)   // ��ȡ��ǰ���������ٲý����?
+#define CMD_MOTOR_GET_DESIRED_DIR   (CMD_BASE_MOTOR + 0x06)   // ��ȡ��ǰ���������ٲý����?
 
 
-// ========== ����豸���ú�? ==========
+// ========== ����豸���ú�? ==========
 // ģʽ�л��꣺0=�����ԣ�����Դȫ�ţ���1=˫���ԣ�˫��Դȫ�ţ�
 #ifndef MOTOR_MODE_BIPOLAR
 #define MOTOR_MODE_BIPOLAR      0
@@ -74,7 +74,7 @@
 #define CAP_ALLOW      (1 << 1)
 
 // ========== ����ö�ٶ��� ==========
-// ���״̬�ṹ�壨����? Device_Read һ���Զ�ȡ��
+// ���״̬�ṹ�壨����? Device_Read һ���Զ�ȡ��
 typedef enum {
     DIR_NONE = 0,
     DIR_FWD = 1,
@@ -126,6 +126,8 @@ typedef enum {
     DEV_ID_UNDERVOLTAGE_REV = 14,   // Ƿѹ-������ת
     DEV_ID_OVERCUR_FWD      = 15,   // ��ת����(����) - block_fwd
     DEV_ID_OVERCUR_REV      = 16,   // ��ת����(�ش�) - block_rev
+    DEV_ID_TIMEOUT_FWD      = 17,   // motion timeout - block forward
+    DEV_ID_TIMEOUT_REV      = 18,   // motion timeout - block reverse
     DEV_ID_MAX
 } MotorDeviceId_t;
 
@@ -139,7 +141,7 @@ typedef enum {
     PRIO_POWER = 5
 } MotorPriority_t;
 
-// ========== ����ṹ��? ==========
+// ========== ����ṹ��? ==========
 typedef struct {
     MotorDeviceId_t device_id;
     MotorPriority_t priority;
@@ -153,7 +155,7 @@ typedef struct {
     MotorState_t state;         // ���״̬��IDLE/RAMPING/RUNNING��
     MotorDir_t active_dir;      // ��ǰ�����
     float current_duty;         // ��ǰռ�ձ�
-    uint8_t enable;             // ���ʹ��״�?
+    uint8_t enable;             // ���ʹ��״�?
 } Motor_StateInfo_t;
 
 #define MAX_COMMANDS_PER_DIRECTION 20
@@ -194,7 +196,7 @@ typedef struct {
     bool conflict_fault;
 } MotorDebugInfo_t;
 
-// ========== ����豸�ṹ��? ==========
+// ========== ����豸�ṹ��? ==========
 typedef struct {
     // �ٲö���
     MotorCommandList_t block_fwd;
@@ -215,7 +217,7 @@ typedef struct {
 
     // �豸����
     uint8_t motor_id;           // ���ID�����ڶ���������
-    uint8_t enable;             // ���ʹ��?
+    uint8_t enable;             // ���ʹ��?
 } MotorDevice_t;
 
 // ========== �¼����ݽṹ������EventBus�� ==========
@@ -242,7 +244,7 @@ typedef struct {
 } MotorCANEvent_t;
 
 typedef struct {
-    uint8_t adc_id;             // ADC�豸ID���ĸ�ADC��⵽�ģ�?
+    uint8_t adc_id;             // ADC�豸ID���ĸ�ADC��⵽�ģ�?
     uint16_t current_ma;        // ��ǰ����(mA)
     uint16_t threshold_ma;      // ������ֵ(mA)
     uint32_t duration_ms;       // ����ʱ��(ms)
@@ -251,20 +253,20 @@ typedef struct {
 // ========== �ٲûص������������壬�û�����д�� ==========
 /**
  * @brief �ٲþ���Ϊֹͣʱ���õĻص�
- * @param motor ����豸ָ��?
+ * @param motor ����豸ָ��?
  */
 void Motor_OnArbitrationStop(MotorDevice_t* motor);
 
 /**
  * @brief �ٲþ���Ϊ��תʱ���õĻص�
- * @param motor ����豸ָ��?
+ * @param motor ����豸ָ��?
  * @param duty ��ǰռ�ձ�
  */
 void Motor_OnArbitrationFwd(MotorDevice_t* motor, float duty);
 
 /**
  * @brief �ٲþ���Ϊ��תʱ���õĻص�
- * @param motor ����豸ָ��?
+ * @param motor ����豸ָ��?
  * @param duty ��ǰռ�ձ�
  */
 void Motor_OnArbitrationRev(MotorDevice_t* motor, float duty);
@@ -302,31 +304,36 @@ void Motor_OnVoltageAlarm(void* payload);
 void Motor_OnCurrentAlarm(void* payload);  // �ѽ���
 void Motor_OnOvercurrentFwd(void* payload);  // ��ת(����)���� �� block_fwd
 void Motor_OnOvercurrentRev(void* payload);  // ��ת(�ش�)���� �� block_rev
-void Motor_OnRTurnLimit(void* payload);  // ��ת��λ
+void Motor_OnRTurnLimit(void* payload);
+// motion timeout: emergency stop both directions (block_fwd + block_rev) and clear allow
+void Motor_OnMotionTimeout(void);
 // ��ȡ��ǰ�ٲ����������򣨼���ǰ����ִ�еķ���
 MotorDir_t Motor_GetDesiredDirection(MotorDevice_t* motor);
 
-// ========== ��ѹ�����ֶ�����ӿ�? ==========
+// ========== ��ѹ�����ֶ�����ӿ�? ==========
 /**
- * @brief �����ѹ�������ٲ��������õ�? block ָ��
- * @param motor ����豸ָ��?
+ * @brief �����ѹ�������ٲ��������õ�? block ָ��
+ * @param motor ����豸ָ��?
  * @param u8AlarmType �������ͣ�VOLTAGE_ALARM_OVERVOLTAGE �� VOLTAGE_ALARM_UNDERVOLTAGE
  * @note ���� VOLTAGE_CLEAR_MODE == VOLTAGE_CLEAR_MANUAL ʱʹ��
  *       �� App_FaultHandler �յ� TOPIC_FAULT_CLEAR �¼�ʱ����
  */
 void Motor_ClearVoltageBlock(MotorDevice_t* motor, uint8_t u8AlarmType);
 
-// ========== ���������ֶ�����ӿ�? ==========
+// ========== ���������ֶ�����ӿ�? ==========
 /**
- * @brief ��������������ٲ��������õ�? block ָ��
- * @param motor ����豸ָ��?
+ * @brief ��������������ٲ��������õ�? block ָ��
+ * @param motor ����豸ָ��?
  * @note �� App_FaultHandler �յ� TOPIC_FAULT_CLEAR �¼�ʱ����
  *       ����������Ϻ���Ҫ����ٲ����е�˫������
  */
 void Motor_ClearOvercurrentBlock(MotorDevice_t* motor);
 
+// motion timeout: remove the two directional block commands to release the lock
+void Motor_ClearMotionTimeoutBlock(MotorDevice_t* motor);
+
 // ========== ��ת�������� ==========
-#define MOTOR_FORWARD_BLANK_MS     (50U)     // 正转消隝时长（ms�?
+#define MOTOR_FORWARD_BLANK_MS     (50U)     // 正转消隝时长（ms�?
 #define MOTOR_REVERSE_BLANK_MS     (0U)   // ��ת����ʱ�䣨ms��
 
 // ========== ��ת���������ⲿ���� ==========

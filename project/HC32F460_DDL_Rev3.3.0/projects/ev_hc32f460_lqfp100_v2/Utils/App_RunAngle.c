@@ -11,6 +11,7 @@
 #include "param_manager.h"
 #include "EventBus.h"           /* TOPIC_MANUAL_RS485 */
 #include "dev_motor.h"          /* MotorManualIOEvent_t, CMD_TYPE_*, DIR_* */
+#include "App_MotionTimeout.h"  /* motion timeout (type2/3) */
 #include <stdlib.h>             /* abs() */
 #include <string.h>
 
@@ -74,6 +75,32 @@ static float DegPerPulse_x10(void)
         return 0.0f;
     }
     return 3600.0f / (float)(pp * 2 * 2) / ratio;
+}
+
+/*=============================================================================
+ * Estimate motion timeout (ms) for goto-target / goto-ref (type2/3).
+ *   omega   = 0x2711 * 6            (deg/s, output shaft)
+ *   t_ms    = dist_x10 * 1000 / (60 * rpm)
+ *   return  = t_ms + margin
+ *   returns 0 when 0x2711 == 0 (detection disabled, also avoids div-by-zero)
+ *============================================================================*/
+static uint32_t RunAngle_EstTimeoutMs(int32_t dist_x10)
+{
+    int16_t  rpm = g_AppParam.target_speed;
+    uint32_t d;
+    uint32_t t_ms;
+
+    if (rpm == 0) {
+        return 0U;
+    }
+    if (rpm < 0) {
+        rpm = (int16_t)(-rpm);
+    }
+
+    d = (uint32_t)((dist_x10 < 0) ? -dist_x10 : dist_x10);
+    t_ms = (d * 1000U) / (60U * (uint32_t)rpm);
+    t_ms += (uint32_t)g_AppParam.timeout_margin_s * 1000U;
+    return t_ms;
 }
 
 /*=============================================================================
@@ -146,6 +173,7 @@ void RunAngle_Update(void)
             ev.dir  = DIR_NONE;
             EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
             s_goto_zero_active = false;
+            MotionTimeout_Cancel();     /* 到位停转 -> 取消超时检测 */
             MAIN_D("[ABSA] Goto-ref complete: offset=%ld, ref=%ld, dist=%ld\r\n",
                    (long)s_abs_offset_x10, (long)ref, (long)dist);
         }
@@ -162,6 +190,7 @@ void RunAngle_Update(void)
             ev.dir  = DIR_NONE;
             EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
             s_goto_target_active = false;
+            MotionTimeout_Cancel();     /* 到位停转 -> 取消超时检测 */
             MAIN_D("[ABSA] Goto-target complete: offset=%ld, target=%ld, dist=%ld\r\n",
                    (long)s_abs_offset_x10, (long)s_target_x10, (long)dist);
         }
@@ -248,6 +277,14 @@ void RunAngle_GotoZero(void)
     }
 
     EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
+
+    /* 类型3: 受理后启动超时检测 (0x2711=0 时关闭) */
+    {
+        uint32_t to_ms = RunAngle_EstTimeoutMs(dist);
+        if (to_ms != 0U) {
+            MotionTimeout_Start(to_ms);
+        }
+    }
 }
 
 void RunAngle_GotoTarget(void)
@@ -293,6 +330,14 @@ void RunAngle_GotoTarget(void)
     }
 
     EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
+
+    /* 类型2: 受理后启动超时检测 (0x2711=0 时关闭) */
+    {
+        uint32_t to_ms = RunAngle_EstTimeoutMs(dist);
+        if (to_ms != 0U) {
+            MotionTimeout_Start(to_ms);
+        }
+    }
 }
 
 int32_t RunAngle_GetTarget_x10(void)

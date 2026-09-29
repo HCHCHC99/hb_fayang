@@ -7,6 +7,7 @@
 #include "dev_rturn.h"          // 旋转限位设备
 #include "App_Params.h"         // 全局参数 g_AppParam 和 Modbus 寄存器
 #include "App_RunAngle.h"
+#include "App_MotionTimeout.h"  // 控制超时故障检测
 
 SystemSim_t g_sim = {
     .sim_pwr_pos = 0,
@@ -650,6 +651,9 @@ void ESystem_Init(void) {
     // 8. 初始化绝对角度模块（在 param_manager 就绪后）
     RunAngle_Init();
 
+    // 9. 初始化控制超时检测看门狗
+    MotionTimeout_Init();
+
     memset(&g_status, 0, sizeof(SystemStatus_t));
 }
 
@@ -751,5 +755,6 @@ void ESystem_MainLoop(void) {
 
     ProcessDeviceUpdates();
     RunAngle_Update();         /* 根据霍尔脉冲增量跟踪绝对角度 */
+    MotionTimeout_Update();    /* 控制超时检测 (1ms 节拍) */
     UpdateStatusIndicators();
 }
