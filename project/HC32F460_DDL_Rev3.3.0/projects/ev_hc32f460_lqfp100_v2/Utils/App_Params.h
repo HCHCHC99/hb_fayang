@@ -36,8 +36,8 @@
 #define REG_CLOSE_LIMIT_ANGLE       (0x271CU)   /* 关窗极限角度 0.1度 (int16_t) */
 #define REG_OPEN_LIMIT_ANGLE        (0x271DU)   /* 开窗极限角度 0.1度 (int16_t) */
 #define REG_CURRENT_DETECT_MS       (0x271EU)   /* 过流判定时间 1ms (uint16_t) */
-#define REG_TIMEOUT_T1              (0x2717U)   /* 类型1(开/关窗)超时时间 秒 (uint16_t, 0=关闭类型1检测) */
-#define REG_TIMEOUT_MARGIN          (0x2718U)   /* 类型2/3(到角度)估算余量 秒 (uint16_t) */
+#define REG_TIMEOUT_T1              (0x2717U)   /* 类型1(开/关窗)超时时间 秒 (int16_t, -1=关闭检测, >=0=受理后固定秒数, 0=受理瞬间即判定) */
+#define REG_TIMEOUT_MARGIN          (0x2718U)   /* 类型2/3(到角度)估算余量 秒 (int16_t, -1=关闭检测, 0=纯运动时间, >0=附加余量) */
 
 /* --- 高级控制参数（不存Flash，但定义在Flash地址范围，仅RAM有效） --- */
 #define REG_MOTOR_HALL_DIR          (0x3710U)   /* 霍尔方向: 0=正常, 1=反转 (uint16_t) */
@@ -119,14 +119,14 @@
 
 /* --- Modbus 协议主要参数 (存储于Flash，掉电保存) --- */
 #define PARAM_DEFAULT_NODE_ID                   (1U)        /* 设备地址 1~247 */
-#define PARAM_DEFAULT_TARGET_SPEED              (0)         /* 目标转速 r/min */
+#define PARAM_DEFAULT_TARGET_SPEED              (5)         /* 目标转速 r/min (1~60, 类型2/3 超时估算基准) */
 #define PARAM_DEFAULT_TARGET_ANGLE              (0)         /* 目标角度 0.1度 */
 #define PARAM_DEFAULT_VOLTAGE_UPPER_LIMIT       (270U)      /* 过压阈值 0.1V (26.0V) */
 #define PARAM_DEFAULT_VOLTAGE_LOWER_LIMIT       (210U)      /* 欠压阈值 0.1V (21.0V) */
 #define PARAM_DEFAULT_CURRENT_UPPER_LIMIT       (1100)      /* 过流阈值 1mA (5A) */
 #define PARAM_DEFAULT_CURRENT_DETECT_MS         (40)        /* 过流判定时间 1ms */
-#define PARAM_DEFAULT_TIMEOUT_T1_S              (0U)        /* 类型1 开/关窗超时时间 秒 (0=关闭类型1检测) */
-#define PARAM_DEFAULT_TIMEOUT_MARGIN_S          (2U)        /* 类型2/3 到角度估算余量 秒 */
+#define PARAM_DEFAULT_TIMEOUT_T1_S              (-1)        /* 类型1 开/关窗超时时间 秒 (-1=关闭类型1检测, 0=受理瞬间即判定) */
+#define PARAM_DEFAULT_TIMEOUT_MARGIN_S          (0)         /* 类型2/3 到角度估算余量 秒 (-1=关闭类型2/3检测, 0=纯运动时间) */
 #define PARAM_DEFAULT_MOTOR_HALL_DIR            (0)         /* 霍尔方向 0=正常, 1=反转 */
 #define PARAM_DEFAULT_MOTOR_DIR                 (1)         /* 电机方向 0=正常, 1=反转 */
 #define PARAM_DEFAULT_RTURN_REDUCTION_RATIO     (11830)     /* 减速比 x0.1 */
@@ -199,8 +199,8 @@ typedef struct {
     uint16_t  motor_hall_pole_pairs;          /* 0x3713: 电机极对数 */
     int16_t   calib_upper_x10;                /* 0x2729: 关窗过流校准有效角度上限 (0.1度) */
     int16_t   calib_lower_x10;                /* 0x272A: 关窗过流校准有效角度下限 (0.1度) */
-    uint16_t  timeout_t1_s;                   /* 0x2717: 类型1 开/关窗超时时间 (秒, 0=关闭检测) */
-    uint16_t  timeout_margin_s;               /* 0x2718: 类型2/3 到角度估算余量 (秒) */
+    int16_t   timeout_t1_s;                   /* 0x2717: 类型1 开/关窗超时时间 (秒, -1=关闭, >=0=固定秒数, 0=受理瞬间即判定) */
+    int16_t   timeout_margin_s;               /* 0x2718: 类型2/3 到角度估算余量 (秒, -1=关闭, 0=纯运动时间, >0=附加余量) */
 
     /* 尾部信息 */
     uint32_t checksum;              /* CRC32校验和 */

@@ -33,12 +33,8 @@ void MotionTimeout_Init(void)
 
 void MotionTimeout_Start(uint32_t timeout_ms)
 {
-    if (timeout_ms == 0U)
-    {
-        /* timeout=0 表示关闭本次检测 */
-        return;
-    }
-
+    /* timeout_ms = 0 -> 受理瞬间即判定(类型1 0x2717=0 的语义);
+     * "关闭检测"由调用方决定是否调用本函数, 不再用 0 表示关闭 */
     s_deadline = (uint32_t)tickTimer_GetCount() + timeout_ms;
     s_armed    = true;
 

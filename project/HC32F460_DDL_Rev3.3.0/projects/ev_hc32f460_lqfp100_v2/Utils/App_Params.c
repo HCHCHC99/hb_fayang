@@ -204,11 +204,11 @@ int32_t Param_ReadByReg(uint16_t regAddr, uint16_t *pValue)
         break;
 
     case REG_TIMEOUT_T1:
-        *pValue = g_AppParam.timeout_t1_s;
+        *pValue = (uint16_t)g_AppParam.timeout_t1_s;
         break;
 
     case REG_TIMEOUT_MARGIN:
-        *pValue = g_AppParam.timeout_margin_s;
+        *pValue = (uint16_t)g_AppParam.timeout_margin_s;
         break;
 
         case REG_MOTOR_HALL_DIR:
@@ -412,11 +412,11 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
         break;
 
     case REG_TIMEOUT_T1:
-        g_AppParam.timeout_t1_s = value;
+        g_AppParam.timeout_t1_s = (int16_t)value;
         break;
 
     case REG_TIMEOUT_MARGIN:
-        g_AppParam.timeout_margin_s = value;
+        g_AppParam.timeout_margin_s = (int16_t)value;
         break;
 
         case REG_MOTOR_HALL_DIR:
@@ -562,8 +562,9 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
                 PARAMS_DBG("REG_CTRL_CMD: RUN FWD (value=0x%04X)", (unsigned int)value);
                 EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
 
-                /* 类型1: 正转(开窗)被受理后启动超时检测, T1=0 时关闭 */
-                if (g_AppParam.timeout_t1_s != 0U)
+                /* 类型1: 正转(开窗)被受理后启动超时检测
+                 *   0x2717 = -1 关闭; >=0 固定 T1 秒 (0 = 受理瞬间即判定) */
+                if (g_AppParam.timeout_t1_s >= 0)
                 {
                     MotionTimeout_Start((uint32_t)g_AppParam.timeout_t1_s * 1000U);
                 }
@@ -590,8 +591,9 @@ int32_t Param_WriteByReg(uint16_t regAddr, uint16_t value)
                 PARAMS_DBG("REG_CTRL_CMD: RUN REV (value=0x%04X)", (unsigned int)value);
                 EventBus_Publish(TOPIC_MANUAL_RS485, &stcEvent);
 
-                /* 类型1: 反转(关窗)被受理后启动超时检测, T1=0 时关闭 */
-                if (g_AppParam.timeout_t1_s != 0U)
+                /* 类型1: 反转(关窗)被受理后启动超时检测
+                 *   0x2717 = -1 关闭; >=0 固定 T1 秒 (0 = 受理瞬间即判定) */
+                if (g_AppParam.timeout_t1_s >= 0)
                 {
                     MotionTimeout_Start((uint32_t)g_AppParam.timeout_t1_s * 1000U);
                 }

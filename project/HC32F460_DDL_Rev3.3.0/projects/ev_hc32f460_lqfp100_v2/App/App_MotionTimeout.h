@@ -26,8 +26,9 @@ void MotionTimeout_Init(void);
 
 /**
  * @brief  启动一次超时检测(受理指令时调用)
- * @param  timeout_ms  超时时长(ms); 传 0 表示关闭本次检测(不启动)
+ * @param  timeout_ms  超时时长(ms); 0 = 受理瞬间即判定(不延时)
  * @note   会覆盖当前正在进行的检测(新指令 = 取消旧的 + 按新参数重新起算)
+ *         是否"关闭检测"由调用方决定是否调用本函数, 本函数不再用 0 表示关闭
  */
 void MotionTimeout_Start(uint32_t timeout_ms);
 

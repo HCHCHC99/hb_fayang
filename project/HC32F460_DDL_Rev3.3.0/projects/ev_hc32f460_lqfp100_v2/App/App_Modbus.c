@@ -870,8 +870,8 @@ void Modbus_SetParamDefaults(void)
     g_AppParam.voltage_lower_limit   = (uint16_t)PARAM_DEFAULT_VOLTAGE_LOWER_LIMIT;
     g_AppParam.current_upper_limit   = (uint16_t)PARAM_DEFAULT_CURRENT_UPPER_LIMIT;
     g_AppParam.current_detect_ms     = (uint16_t)PARAM_DEFAULT_CURRENT_DETECT_MS;
-    g_AppParam.timeout_t1_s          = (uint16_t)PARAM_DEFAULT_TIMEOUT_T1_S;
-    g_AppParam.timeout_margin_s      = (uint16_t)PARAM_DEFAULT_TIMEOUT_MARGIN_S;
+    g_AppParam.timeout_t1_s          = (int16_t)PARAM_DEFAULT_TIMEOUT_T1_S;
+    g_AppParam.timeout_margin_s      = (int16_t)PARAM_DEFAULT_TIMEOUT_MARGIN_S;
     g_AppParam.close_limit_angle     = (int16_t)PARAM_DEFAULT_CLOSE_LIMIT_ANGLE;
     g_AppParam.open_limit_angle      = (int16_t)PARAM_DEFAULT_OPEN_LIMIT_ANGLE;
     g_AppParam.baud_rate             = PARAM_DEFAULT_BAUD_RATE;

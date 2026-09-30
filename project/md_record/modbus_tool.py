@@ -17,10 +17,13 @@ VALIDATION_RULES = {
     0x2714: (250,  270,   2,  0.1, "V"),    # 过压阈值 25.0~27.0V, 步进0.2V
     0x2715: (210,  230,   2,  0.1, "V"),    # 欠压阈值 21.0~23.0V, 步进0.2V
     0x2716: (0,    2500, 50,  1,   "mA"),   # 过流阈值 0~2500mA, 步进50mA  ← 修改这里
-    0x271E: (0,    2000, 20,  1,   "ms"),   # 判定时间 0~2000ms, 步进20ms
+    0x271E: (0,    400,  5,   1,   "ms"),   # 判定时间 0~400ms, 步进5ms
     0x3712: (10,  65535,  0,  0.1, ""),     # 减速比 1.0~6553.5, 单位0.1
     0x3713: (1,     100,  0,  1,   ""),     # 极对数 1~100, 不取整
     0x2726: (0,     200,  0,  0.1, "°"),    # 停止阈值 0~20.0°, 步进0.1°
+    0x2711: (1,      60,  1,  1,   "r/min"),# 目标转速 1~60 r/min, 步进1 (类型2/3 超时估算基准)
+    0x2717: (-1,     20,  1,  1,   "s"),    # 类型1 固定超时 -1~20s, 步进1 (-1=关闭; 0=受理瞬间即判定)
+    0x2718: (-1,     20,  1,  1,   "s"),    # 类型2/3 余量 -1~20s, 步进1 (-1=关闭; 0=纯运动时间)
 }
 
 def apply_validation(regAddr, raw_value):
@@ -51,7 +54,7 @@ def fmt_constraint(regAddr):
         return ""
     vmin, vmax, step, unit, label = rule
     parts = []
-    if vmin > 0 or regAddr == 0x2716 or regAddr == 0x271E:
+    if vmin != 0 or regAddr in (0x2716, 0x271E):
         parts.append(f"最小 {vmin*unit:.1f}{label}" if unit < 1 else f"最小 {vmin}{label}")
     parts.append(f"最大 {vmax*unit:.1f}{label}" if unit < 1 else f"最大 {vmax}{label}")
     if step > 0:
@@ -171,7 +174,7 @@ def menu_read_realtime():
     # 禁用实时角度 (0x2731)
     if addr == 0x2731:
         print("\n  ⚠ 此功能已禁用！")
-        print("  📌 请到菜单 [8. 关窗基准点] → [4. 读绝对角度(RAM)] 查看角度")
+        print("  📌 请到菜单 [9. 关窗基准点] → [4. 读绝对角度(RAM)] 查看角度")
         print("     或 [5. 解读绝对角度RAM] 手动解析回令数据")
         return
 
@@ -205,6 +208,19 @@ def menu_control():
     node = ask_node()
     req_data = [node, 0x06, 0x27, 0x20, (val>>8)&0xFF, val&0xFF]
     print_cmd(req_data, node)
+
+    if val == 0x0010 or val == 0x0020:
+        t1 = TIMEOUT_CFG['t1']
+        print("\n  ⏱ 超时检测提示（类型1 固定时间）")
+        print("    依据 0x2717(T1): 指令被受理后 T1 秒仍未停转 → 报“运动超时”(0x2740 bit7)")
+        if t1 is None:
+            print("    T1 未知: 可在[时间配置]里读/写，或直接读 0x2717")
+        elif t1 < 0:
+            print("    当前 T1 = -1 → 关闭类型1 超时检测")
+        elif t1 == 0:
+            print("    当前 T1 = 0 → 受理瞬间即判定超时")
+        else:
+            print(f"    当前 T1 = {t1} 秒 → 受理后约 {t1} 秒判定超时")
 
 # ===== 3. 读配置寄存器 =====
 def menu_read_config():
@@ -305,16 +321,103 @@ def menu_write_config():
     else:
         print_cmd(req_data, node)
 
+# ===== 时间配置（超时故障检测）=====
+# 本工具只生成指令、不回读响应，因此 TIMEOUT_CFG 记录的是"用户在本工具里写入的值"，
+# 仅用于后续估算展示，不代表设备实际值（实际值以读 0x2711/0x2717/0x2718 的回令为准）。
+TIMEOUT_CFG = {"rpm": None, "t1": None, "margin": None}
+
+TIMEOUT_REGS = [
+    (0x2711, "目标转速",    "r/min", "类型2/3 估算基准(1~60)", "rpm"),
+    (0x2717, "T1 固定超时", "s",     "类型1 开窗/关窗(-1关/0即判)", "t1"),
+    (0x2718, "余量",        "s",     "类型2/3 附加余量(-1关/0纯运动)", "margin"),
+]
+
+def timeout_cfg_disp():
+    def f(v, u):
+        return f"{v}{u}" if v is not None else "未知"
+    return (f"转速(0x2711)={f(TIMEOUT_CFG['rpm'], ' r/min')}, "
+            f"T1(0x2717)={f(TIMEOUT_CFG['t1'], ' s')}, "
+            f"余量(0x2718)={f(TIMEOUT_CFG['margin'], ' s')}")
+
+def timeout_note_get_angle():
+    print("    【获取当前角度】01 03 27 21 00 02   (读 0x2721+0x2722, int32, 0.1°)")
+
+def timeout_calc_type23(cur_x10, tgt_x10):
+    """类型2/3: 按 0x2711(输出轴 r/min) + 0x2718(余量) 估算超时时间"""
+    rpm = TIMEOUT_CFG.get('rpm')
+    if rpm is None:
+        rpm = ask_value("目标转速 0x2711 (r/min)")
+    if rpm is None:
+        print("    未提供转速 → 跳过估算")
+        return
+    if rpm <= 0:
+        print("    0x2711 <= 0 → 无法推算(校验下限为1) → 不启用超时检测")
+        return
+    margin = TIMEOUT_CFG.get('margin')
+    if margin is None:
+        m = ask_value("余量 0x2718 (s) [默认0]")
+        margin = 0 if m is None else m
+    if margin < 0:
+        print("    0x2718 = -1 → 关闭类型2/3 超时检测")
+        return
+    dist = abs(tgt_x10 - cur_x10)
+    t_ms = dist * 1000 // (60 * rpm) + margin * 1000
+    print(f"    距离 = |{tgt_x10} - {cur_x10}| = {dist} (0.1°) = {dist * 0.1:.1f}°")
+    if margin == 0:
+        print(f"    估算 = {dist * 0.1:.1f}° ÷ (6 × {rpm}°/s) = 纯运动时间 ≈ {t_ms / 1000:.1f} 秒后判定超时")
+    else:
+        print(f"    估算 = {dist * 0.1:.1f}° ÷ (6 × {rpm}°/s) + 余量 {margin}s ≈ {t_ms / 1000:.1f} 秒后判定超时")
+
+def menu_timeout_config():
+    while True:
+        print("\n====== 时间配置（超时故障检测）======")
+        print("  类型1(开窗/关窗): T1(0x2717) 固定时间;  类型2/3(到目标/回基准): 转速(0x2711) 估算 + 余量(0x2718)")
+        print("  0x2717=-1 关闭类型1 (0=受理瞬间即判定);  0x2718=-1 关闭类型2/3 (0=纯运动时间)")
+        for i, (addr, name, unit, desc, _key) in enumerate(TIMEOUT_REGS):
+            u = f" [{unit}]" if unit else ""
+            print(f"  {i*2+1}. 读 {name}（0x{addr:04X}）{u}{fmt_constraint(addr)}  — {desc}")
+            print(f"  {i*2+2}. 写 {name}（0x{addr:04X}）{u}")
+        print(f"  本工具已记录: {timeout_cfg_disp()}")
+        print("  0. 返回")
+        c = input("选择: ").strip()
+        if c == '0' or c == '':
+            return
+        try:
+            ci = int(c)
+        except:
+            print("无效"); continue
+        if ci < 1 or ci > len(TIMEOUT_REGS) * 2:
+            print("无效"); continue
+        idx = (ci - 1) // 2
+        is_write = ((ci - 1) % 2) == 1
+        addr, name, unit, desc, key = TIMEOUT_REGS[idx]
+        node = ask_node()
+        if is_write:
+            val = ask_value(f"值（单位：{unit}）" if unit else "值")
+            if val is None:
+                print("无效"); continue
+            val, _fixed = apply_validation(addr, val)
+            if _fixed:
+                print(f"  ⚠ 值已按 MCU 校验修正为 {val}")
+            req_data = [node, 0x06, (addr >> 8) & 0xFF, addr & 0xFF, (val >> 8) & 0xFF, val & 0xFF]
+            print_cmd(req_data, node)
+            TIMEOUT_CFG[key] = val
+        else:
+            req_data = [node, 0x03, (addr >> 8) & 0xFF, addr & 0xFF, 0x00, 0x01]
+            print(f"\n  ▎{name}（0x{addr:04X}）")
+            print_cmd(req_data, node)
+        input("\n按 Enter 返回...")
+
 # ===== 5. 查看故障 =====
 def menu_read_fault():
     node = ask_node()
     req_data = [node, 0x03, 0x27, 0x40, 0x00, 0x01]
 
     print(f"\n  ▎故障状态（0x2740）")
-    print(f"  ▎bit0=过压  bit1=开窗过流(正转)  bit2=关窗过流(反转)  bit6=欠压")
+    print(f"  ▎bit0=过压  bit1=开窗过流(正转)  bit2=关窗过流(反转)  bit6=欠压  bit7=运动超时")
     print(f"  回令解析示例:")
     for lb, v in [("无故障", 0), ("过压", 0x0001), ("开窗过流", 0x0002),
-                  ("关窗过流", 0x0004), ("欠压", 0x0040)]:
+                  ("关窗过流", 0x0004), ("欠压", 0x0040), ("运动超时", 0x0080)]:
         rd = [node, 0x03, 0x02, (v>>8)&0xFF, v&0xFF]
         rcr = modbus_crc16(rd)
         rq = ' '.join(f'{b:02X}' for b in rd)
@@ -393,6 +496,15 @@ def menu_window_zero():
             node = ask_node()
             req_data = [node, 0x06, 0x27, 0x25, 0x00, 0x01]
             print_cmd(req_data, node)
+            print("\n  ⏱ 超时检测提示（类型2/3 估算）")
+            timeout_note_get_angle()
+            print("    【基准点角度】01 03 27 1C 00 01   (读 0x271C 关窗极限角度, 0.1°)")
+            print("    【回基准点指令】01 06 27 25 00 01")
+            cur = ask_value("当前角度 (0.1°, 回车跳过估算)")
+            if cur is not None:
+                ref = ask_value("基准点角度 0x271C (0.1°)")
+                if ref is not None:
+                    timeout_calc_type23(cur, ref)
             input("\n按 Enter 返回...")
         elif c == '3':
             print("\n====== 转动到目标角度 =====")
@@ -413,6 +525,12 @@ def menu_window_zero():
             req_data = [node, 0x10, 0x27, 0x27, 0x00, 0x02, 0x04,
                         (lo>>8)&0xFF, lo&0xFF, (hi>>8)&0xFF, hi&0xFF]
             print_cmd(req_data, node)
+            print("\n  ⏱ 超时检测提示（类型2/3 估算）")
+            timeout_note_get_angle()
+            print("    【目标角度指令】01 10 27 27 00 02 04 <lo> <hi>   (0x10 写 0x2727+0x2728)")
+            cur = ask_value("当前角度 (0.1°, 回车跳过估算)")
+            if cur is not None:
+                timeout_calc_type23(cur, val)
             input("\n按 Enter 返回...")
         elif c == '4':
             node = ask_node()
@@ -455,6 +573,47 @@ def menu_window_zero():
         else:
             print("无效")
 
+def parse_abs_angle_reply(s):
+    """解析 0x03 读 0x2721+0x2722 的回令帧 -> (角度0.1°整数值, 错误信息)
+       成功: (val, None)；失败: (None, 原因)"""
+    parts = s.split()
+    if len(parts) < 7:
+        return None, f"需要至少7字节，当前 {len(parts)} 字节"
+    raw = [int(x, 16) for x in parts]
+    # Modbus int32: 低寄存器(0x2721)在前，每寄存器大端
+    # 字节序: [reg0_H, reg0_L, reg1_H, reg1_L]
+    low16  = (raw[3] << 8) | raw[4]
+    high16 = (raw[5] << 8) | raw[6]
+    val = (high16 << 16) | low16
+    if val > 0x7FFFFFFF:
+        val -= 0x100000000
+    return val, None
+
+def ask_angle_value(prompt="输入当前角度"):
+    """二选一输入角度: 直接输角度(0.1°) 或 粘贴设备回令帧(自动解析)"""
+    print(f"  {prompt}")
+    print("    方式1: 直接输入角度 (0.1°，如 880 = 88.0°，-15 = -1.5°)")
+    print("    方式2: 粘贴设备回令帧 (如 01 03 04 FF F8 FF FF 4A 66)，自动解析")
+    s = input("  请输入: ").strip()
+    if not s:
+        return None
+    if len(s.split()) > 1:
+        try:
+            val, err = parse_abs_angle_reply(s)
+        except ValueError:
+            print("  解析失败: 包含非法十六进制字符"); return None
+        except Exception as e:
+            print(f"  解析失败: {e}"); return None
+        if err:
+            print(f"  解析失败: {err}"); return None
+        print(f"  → 已解析回令: {val} (0.1°) = {val*0.1:.1f}°")
+        return val
+    try:
+        return int(s, 16) if s.lower().startswith("0x") else int(s)
+    except ValueError:
+        print("  无效: 既不是角度数值，也不是回令帧")
+        return None
+
 def menu_parse_abs_angle():
     """解读绝对角度RAM - 解析从机返回的4字节数据，循环直到用户选择退出"""
     print("\n====== 解读绝对角度RAM =====")
@@ -470,32 +629,11 @@ def menu_parse_abs_angle():
             return
 
         try:
-            parts = s.split()
-            if len(parts) < 7:
-                print(f"  格式错误: 需要至少7字节，当前 {len(parts)} 字节")
+            val, err = parse_abs_angle_reply(s)
+            if err:
+                print(f"  格式错误: {err}")
                 continue
-
-            raw = [int(x, 16) for x in parts]
-
-            # 提取4字节数据 (int32, Modbus双寄存器格式)
-            data_bytes = raw[3:7]
-
-            if len(data_bytes) < 4:
-                print(f"  数据长度不足: 需要4字节，当前 {len(data_bytes)} 字节")
-                continue
-
-            # Modbus int32: 两个16位寄存器(每寄存器大端), 低寄存器(0x2721)在前
-            # 字节顺序: [reg0_H, reg0_L, reg1_H, reg1_L]
-            low16  = (data_bytes[0] << 8) | data_bytes[1]
-            high16 = (data_bytes[2] << 8) | data_bytes[3]
-            val = (high16 << 16) | low16
-
-            # 处理负数 (int32)
-            if val > 0x7FFFFFFF:
-                val = val - 0x100000000
-
             angle = val * 0.1
-
             print(f"  → 原始值: {val} (0.1°)")
             print(f"  → 实际角度: {angle:.1f}°")
 
@@ -503,6 +641,54 @@ def menu_parse_abs_angle():
             print("  解析失败: 包含非法十六进制字符")
         except Exception as e:
             print(f"  解析失败: {e}")
+
+# ===== 开发者选项 - 超时时间计算 =====
+def menu_timeout_calc_dev():
+    print("\n====== 超时时间计算（类型2/3：到目标角度）======")
+    node = ask_node()
+
+    print("  【获取当前角度】")
+    print_cmd([node, 0x03, 0x27, 0x21, 0x00, 0x02], node, note="读 0x2721+0x2722 (int32, 0.1°)")
+
+    cur = ask_angle_value("输入当前角度（二选一）")
+    if cur is None:
+        print("无效"); input("\n按 Enter 返回..."); return
+    tgt = ask_value("目标角度 (0.1°)")
+    if tgt is None:
+        print("无效"); input("\n按 Enter 返回..."); return
+    rpm = ask_value("转速 0x2711 (r/min)")
+    if rpm is None:
+        print("无效"); input("\n按 Enter 返回..."); return
+
+    # ---- 到达目标角度的指令 (0x10 写 0x2727+0x2728, int32 小端: lo 先) ----
+    val = max(-2147483648, min(2147483647, tgt))
+    lo = val & 0xFFFF
+    hi = (val >> 16) & 0xFFFF
+    req_data = [node, 0x10, 0x27, 0x27, 0x00, 0x02, 0x04,
+                (lo >> 8) & 0xFF, lo & 0xFF, (hi >> 8) & 0xFF, hi & 0xFF]
+    print(f"\n  ▎到达目标角度指令  目标角度: {val} (0.1°) = {val * 0.1:.1f}°")
+    print_cmd(req_data, node)
+
+    # ---- 超时检测时间 (与固件 RunAngle_EstTimeoutMs 同公式) ----
+    print("\n  ⏱ 超时检测时间（类型2/3 估算）")
+    if rpm <= 0:
+        print("    0x2711 <= 0 → 无法推算(校验下限为1) → 不启用超时检测")
+        input("\n按 Enter 返回..."); return
+    margin = TIMEOUT_CFG.get('margin')
+    if margin is None:
+        m = ask_value("余量 0x2718 (s) [默认0]")
+        margin = 0 if m is None else m
+    if margin < 0:
+        print("    0x2718 = -1 → 关闭类型2/3 超时检测")
+        input("\n按 Enter 返回..."); return
+    dist = abs(tgt - cur)
+    t_ms = dist * 1000 // (60 * rpm) + margin * 1000
+    print(f"    距离 = |{tgt} - {cur}| = {dist} (0.1°) = {dist * 0.1:.1f}°")
+    if margin == 0:
+        print(f"    估算 = {dist * 0.1:.1f}° ÷ (6 × {rpm}°/s) = 纯运动时间 ≈ {t_ms / 1000:.1f} 秒后判定超时")
+    else:
+        print(f"    估算 = {dist * 0.1:.1f}° ÷ (6 × {rpm}°/s) + 余量 {margin}s ≈ {t_ms / 1000:.1f} 秒后判定超时")
+    input("\n按 Enter 返回...")
 
 # ===== 9. 开发者选项 (需密码) =====
 def menu_dev_options():
@@ -518,6 +704,7 @@ def menu_dev_options():
         print("  6. 计算实时角度")
         print("  7. 关窗基准点（高级）")
         print("  8. 关窗过流校准阈值")
+        print("  9. 超时时间计算")
         print("  0. 返回")
         c = input("选择: ").strip()
         if c == '0':
@@ -538,6 +725,8 @@ def menu_dev_options():
             menu_window_zero_advanced()
         elif c == '8':
             menu_calib_threshold()
+        elif c == '9':
+            menu_timeout_calc_dev()
         else:
             print("无效")
 
@@ -859,6 +1048,7 @@ MENU = [
     ("控制",           menu_control),
     ("读配置寄存器",   menu_read_config),
     ("写配置寄存器",   menu_write_config),
+    ("时间配置",       menu_timeout_config),
     ("查看故障",       menu_read_fault),
     ("清除故障",       menu_clear_fault),
     ("心跳包",         menu_heartbeat),
@@ -866,20 +1056,21 @@ MENU = [
 ]
 
 def main():
+    dev_key = len(MENU) + 1
     while True:
         print("\n" + "=" * 42)
         print("  Modbus RTU 指令生成器 v4.5")
         print("=" * 42)
         for i, (name, _) in enumerate(MENU):
             print(f"  {i+1}. {name}")
-        print("  9. 开发者选项")
+        print(f"  {dev_key}. 开发者选项")
         print("  0. 退出")
         print("=" * 42)
-        c = input("选择 [0-9]: ").strip()
+        c = input(f"选择 [0-{dev_key}]: ").strip()
         if c == '0':
             print("退出")
             break
-        if c == '9':
+        if c == str(dev_key):
             menu_dev_options()
         else:
             try:

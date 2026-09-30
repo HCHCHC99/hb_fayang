@@ -79,28 +79,32 @@ static float DegPerPulse_x10(void)
 
 /*=============================================================================
  * Estimate motion timeout (ms) for goto-target / goto-ref (type2/3).
- *   omega   = 0x2711 * 6            (deg/s, output shaft)
- *   t_ms    = dist_x10 * 1000 / (60 * rpm)
- *   return  = t_ms + margin
- *   returns 0 when 0x2711 == 0 (detection disabled, also avoids div-by-zero)
+ *   omega   = 0x2711 * 6                   (deg/s, output shaft)
+ *   t_ms    = dist_x10 * 1000 / (60 * rpm) (纯运动时间)
+ *   return  = t_ms + 0x2718 * 1000
+ *   0x2718 (余量) 语义: -1 = 关闭类型2/3检测; 0 = 纯运动时间; >0 = 附加余量秒数
+ *   return 负值(-1) 表示本次不启动检测 (余量=-1 或 转速<=0 无法推算)
  *============================================================================*/
-static uint32_t RunAngle_EstTimeoutMs(int32_t dist_x10)
+static int32_t RunAngle_EstTimeoutMs(int32_t dist_x10)
 {
-    int16_t  rpm = g_AppParam.target_speed;
+    int16_t  rpm    = g_AppParam.target_speed;
+    int16_t  margin = g_AppParam.timeout_margin_s;
     uint32_t d;
     uint32_t t_ms;
 
-    if (rpm == 0) {
-        return 0U;
+    /* 0x2718 = -1 -> 关闭类型2/3检测 */
+    if (margin < 0) {
+        return -1;
     }
-    if (rpm < 0) {
-        rpm = (int16_t)(-rpm);
+    /* 转速 0 无法推算 (校验下限为 1, 此处兜底防除零) */
+    if (rpm <= 0) {
+        return -1;
     }
 
     d = (uint32_t)((dist_x10 < 0) ? -dist_x10 : dist_x10);
     t_ms = (d * 1000U) / (60U * (uint32_t)rpm);
-    t_ms += (uint32_t)g_AppParam.timeout_margin_s * 1000U;
-    return t_ms;
+    t_ms += (uint32_t)margin * 1000U;   /* margin >= 0: 0 = 纯运动时间, >0 = 附加余量 */
+    return (int32_t)t_ms;
 }
 
 /*=============================================================================
@@ -278,11 +282,11 @@ void RunAngle_GotoZero(void)
 
     EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
 
-    /* 类型3: 受理后启动超时检测 (0x2711=0 时关闭) */
+    /* 类型3: 受理后启动超时检测 (0x2718=-1 时关闭) */
     {
-        uint32_t to_ms = RunAngle_EstTimeoutMs(dist);
-        if (to_ms != 0U) {
-            MotionTimeout_Start(to_ms);
+        int32_t to_ms = RunAngle_EstTimeoutMs(dist);
+        if (to_ms >= 0) {
+            MotionTimeout_Start((uint32_t)to_ms);
         }
     }
 }
@@ -331,11 +335,11 @@ void RunAngle_GotoTarget(void)
 
     EventBus_Publish(TOPIC_MANUAL_RS485, &ev);
 
-    /* 类型2: 受理后启动超时检测 (0x2711=0 时关闭) */
+    /* 类型2: 受理后启动超时检测 (0x2718=-1 时关闭) */
     {
-        uint32_t to_ms = RunAngle_EstTimeoutMs(dist);
-        if (to_ms != 0U) {
-            MotionTimeout_Start(to_ms);
+        int32_t to_ms = RunAngle_EstTimeoutMs(dist);
+        if (to_ms >= 0) {
+            MotionTimeout_Start((uint32_t)to_ms);
         }
     }
 }
