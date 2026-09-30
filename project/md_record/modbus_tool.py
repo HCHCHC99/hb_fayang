@@ -339,8 +339,29 @@ def timeout_cfg_disp():
             f"T1(0x2717)={f(TIMEOUT_CFG['t1'], ' s')}, "
             f"余量(0x2718)={f(TIMEOUT_CFG['margin'], ' s')}")
 
-def timeout_note_get_angle():
-    print("    【获取当前角度】01 03 27 21 00 02   (读 0x2721+0x2722, int32, 0.1°)")
+# --- 类型2/3 配套指令贴心提示（客户可直接复制发送，均含 CRC） ---
+def timeout_hint_read_angle(node):
+    """【获取当前绝对角度】—— 类型2/3 估算的第一步"""
+    print("  【获取当前绝对角度】")
+    print_cmd([node, 0x03, 0x27, 0x21, 0x00, 0x02], node,
+              note="读 0x2721+0x2722 = 当前绝对角度 (int32, 0.1°)；"
+                   "收到回令后把它整帧粘到下面“当前角度”输入框即可自动解析")
+
+def timeout_hint_read_ref(node):
+    """【获取关窗基准点角度】—— 类型3 回基准点的目标角度"""
+    print("  【获取关窗基准点角度】")
+    print_cmd([node, 0x03, 0x27, 0x1C, 0x00, 0x01], node,
+              note="读 0x271C 关窗基准点角度 (int16, 0.1°)；作为回基准点的目标角度")
+
+def timeout_hint_goto(node, tgt_x10):
+    """【转到目标角度】的指令 —— 这条就是被超时检测的指令"""
+    val = max(-2147483648, min(2147483647, int(tgt_x10)))
+    lo = val & 0xFFFF
+    hi = (val >> 16) & 0xFFFF
+    print(f"  【转到目标角度】{val} (0.1°) = {val * 0.1:.1f}°  ← 本条即被超时检测的指令")
+    print_cmd([node, 0x10, 0x27, 0x27, 0x00, 0x02, 0x04,
+               (lo >> 8) & 0xFF, lo & 0xFF, (hi >> 8) & 0xFF, hi & 0xFF], node,
+              note="0x10 写 0x2727+0x2728 (int32 小端: 低16位在前)")
 
 def timeout_calc_type23(cur_x10, tgt_x10):
     """类型2/3: 按 0x2711(输出轴 r/min) + 0x2718(余量) 估算超时时间"""
@@ -496,10 +517,10 @@ def menu_window_zero():
             node = ask_node()
             req_data = [node, 0x06, 0x27, 0x25, 0x00, 0x01]
             print_cmd(req_data, node)
-            print("\n  ⏱ 超时检测提示（类型2/3 估算）")
-            timeout_note_get_angle()
-            print("    【基准点角度】01 03 27 1C 00 01   (读 0x271C 关窗极限角度, 0.1°)")
-            print("    【回基准点指令】01 06 27 25 00 01")
+            print("\n  ⏱ 超时检测提示（类型3 回基准点 · 按 0x2711 转速估算）")
+            print("    判定 = 上方【回到关窗基准点】指令被受理后，超过推算时间仍未到位 → 报“运动超时”(0x2740 bit7)")
+            timeout_hint_read_angle(node)
+            timeout_hint_read_ref(node)
             cur = ask_value("当前角度 (0.1°, 回车跳过估算)")
             if cur is not None:
                 ref = ask_value("基准点角度 0x271C (0.1°)")
@@ -525,9 +546,9 @@ def menu_window_zero():
             req_data = [node, 0x10, 0x27, 0x27, 0x00, 0x02, 0x04,
                         (lo>>8)&0xFF, lo&0xFF, (hi>>8)&0xFF, hi&0xFF]
             print_cmd(req_data, node)
-            print("\n  ⏱ 超时检测提示（类型2/3 估算）")
-            timeout_note_get_angle()
-            print("    【目标角度指令】01 10 27 27 00 02 04 <lo> <hi>   (0x10 写 0x2727+0x2728)")
+            print("\n  ⏱ 超时检测提示（类型2 到目标角度 · 按 0x2711 转速估算）")
+            print(f"    判定 = 上方【目标角度】指令(目标 {val})被受理后，超过推算时间仍未到位 → 报“运动超时”(0x2740 bit7)")
+            timeout_hint_read_angle(node)
             cur = ask_value("当前角度 (0.1°, 回车跳过估算)")
             if cur is not None:
                 timeout_calc_type23(cur, val)
@@ -645,11 +666,10 @@ def menu_parse_abs_angle():
 # ===== 开发者选项 - 超时时间计算 =====
 def menu_timeout_calc_dev():
     print("\n====== 超时时间计算（类型2/3：到目标角度）======")
+    print("  用途：先估算“转到目标角度”的耗时，据此配置 0x2711(转速)/0x2718(余量)，避免误报超时")
     node = ask_node()
 
-    print("  【获取当前角度】")
-    print_cmd([node, 0x03, 0x27, 0x21, 0x00, 0x02], node, note="读 0x2721+0x2722 (int32, 0.1°)")
-
+    timeout_hint_read_angle(node)
     cur = ask_angle_value("输入当前角度（二选一）")
     if cur is None:
         print("无效"); input("\n按 Enter 返回..."); return
@@ -661,13 +681,8 @@ def menu_timeout_calc_dev():
         print("无效"); input("\n按 Enter 返回..."); return
 
     # ---- 到达目标角度的指令 (0x10 写 0x2727+0x2728, int32 小端: lo 先) ----
-    val = max(-2147483648, min(2147483647, tgt))
-    lo = val & 0xFFFF
-    hi = (val >> 16) & 0xFFFF
-    req_data = [node, 0x10, 0x27, 0x27, 0x00, 0x02, 0x04,
-                (lo >> 8) & 0xFF, lo & 0xFF, (hi >> 8) & 0xFF, hi & 0xFF]
-    print(f"\n  ▎到达目标角度指令  目标角度: {val} (0.1°) = {val * 0.1:.1f}°")
-    print_cmd(req_data, node)
+    print("\n  ▎配套指令")
+    timeout_hint_goto(node, tgt)
 
     # ---- 超时检测时间 (与固件 RunAngle_EstTimeoutMs 同公式) ----
     print("\n  ⏱ 超时检测时间（类型2/3 估算）")
